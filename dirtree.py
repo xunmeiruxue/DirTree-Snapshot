@@ -4,22 +4,27 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import stat
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Optional, Sequence
+from typing import Callable, Iterator, Optional, Sequence, TextIO
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+HASH_CHUNK_SIZE = 1024 * 1024
+PROGRESS_REFRESH_SECONDS = 0.1
 WarningHandler = Callable[[Path, str], None]
 
 
 @dataclass(frozen=True)
 class SnapshotOptions:
     directories_only: bool = False
+    include_hash: bool = False
 
 
 @dataclass
@@ -35,6 +40,107 @@ class _TreeEntry:
     path: Path
     name: str
     kind: str
+    size: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class _HashTotals:
+    files: int = 0
+    bytes: int = 0
+
+
+class _HashProgress:
+    def __init__(self, totals: _HashTotals, stream: TextIO, enabled: bool) -> None:
+        self.totals = totals
+        self.stream = stream
+        self.enabled = enabled
+        self.processed_files = 0
+        self.processed_bytes = 0
+        self._finished = False
+        self._started = False
+        self._last_render = 0.0
+        self._line_width = 0
+
+    def start(self) -> None:
+        self._started = True
+        if self.enabled:
+            self._render(force=True)
+        else:
+            print(
+                f"Hashing {self.totals.files} files ({self.totals.bytes} B)...",
+                file=self.stream,
+            )
+
+    def advance_bytes(self, byte_count: int) -> None:
+        self.processed_bytes += byte_count
+        self._render()
+
+    def finish_file(self, expected_size: Optional[int], bytes_read: int) -> None:
+        if expected_size is not None and expected_size > bytes_read:
+            self.processed_bytes += expected_size - bytes_read
+        self.processed_files += 1
+        self._render()
+
+    def message(self, text: str) -> None:
+        if self.enabled and self._started:
+            self.stream.write("\r" + (" " * self._line_width) + "\r")
+        self.stream.write(text + "\n")
+        self.stream.flush()
+        if self.enabled and self._started:
+            self._line_width = 0
+            self._render(force=True)
+
+    def finish(self, completed: bool) -> None:
+        if not self._started:
+            return
+
+        if completed:
+            self._finished = True
+            self.processed_files = max(self.processed_files, self.totals.files)
+            self.processed_bytes = max(self.processed_bytes, self.totals.bytes)
+
+        if self.enabled:
+            self._render(force=True)
+            self.stream.write("\n")
+            self.stream.flush()
+        else:
+            print("Hashing complete." if completed else "Hashing stopped.", file=self.stream)
+        self._started = False
+
+    def _ratio(self) -> float:
+        if self._finished:
+            return 1.0
+        if self.totals.bytes > 0:
+            return min(self.processed_bytes / self.totals.bytes, 1.0)
+        if self.totals.files > 0:
+            return min(self.processed_files / self.totals.files, 1.0)
+        return 1.0
+
+    def _render(self, force: bool = False) -> None:
+        if not self.enabled or not self._started:
+            return
+
+        now = time.monotonic()
+        if not force and now - self._last_render < PROGRESS_REFRESH_SECONDS:
+            return
+        self._last_render = now
+
+        ratio = self._ratio()
+        bar_width = 24
+        filled = min(int(ratio * bar_width), bar_width)
+        bar = ("#" * filled) + ("-" * (bar_width - filled))
+        shown_bytes = self.processed_bytes
+        if self.totals.bytes > 0:
+            shown_bytes = min(shown_bytes, self.totals.bytes)
+        line = (
+            f"Hashing [{bar}] {ratio * 100:6.2f}% "
+            f"{self.processed_files}/{self.totals.files} files "
+            f"{shown_bytes}/{self.totals.bytes} B"
+        )
+        padded_line = line.ljust(self._line_width)
+        self._line_width = max(self._line_width, len(line))
+        self.stream.write("\r" + padded_line)
+        self.stream.flush()
 
 
 _LAST_BRANCH = chr(96) + "-- "
@@ -109,7 +215,17 @@ def _read_entries(
 
                 if options.directories_only and kind == "file":
                     continue
-                entries.append(_TreeEntry(path=path, name=entry.name, kind=kind))
+
+                size: Optional[int] = None
+                if kind == "file":
+                    try:
+                        size = entry.stat(follow_symlinks=False).st_size
+                    except OSError as exc:
+                        _report_error(stats, on_warning, path, str(exc))
+
+                entries.append(
+                    _TreeEntry(path=path, name=entry.name, kind=kind, size=size)
+                )
     except OSError as exc:
         _report_error(stats, on_warning, directory, str(exc))
         return None
@@ -119,6 +235,82 @@ def _read_entries(
     return entries
 
 
+def _measure_hash_work(root: Path, excluded_paths: set[str]) -> _HashTotals:
+    total_files = 0
+    total_bytes = 0
+    directories = [root]
+
+    while directories:
+        directory = directories.pop()
+        try:
+            with os.scandir(directory) as scanned_entries:
+                for entry in scanned_entries:
+                    path = Path(entry.path)
+                    if _path_key(path) in excluded_paths:
+                        continue
+                    try:
+                        kind = _classify_entry(entry)
+                    except OSError:
+                        continue
+
+                    if kind == "directory":
+                        directories.append(path)
+                    elif kind == "file":
+                        total_files += 1
+                        try:
+                            total_bytes += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
+        except OSError:
+            continue
+
+    return _HashTotals(files=total_files, bytes=total_bytes)
+
+
+def _sha256(path: Path, on_chunk: Optional[Callable[[int], None]] = None) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        while True:
+            chunk = file_handle.read(HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+            if on_chunk is not None:
+                on_chunk(len(chunk))
+    return digest.hexdigest()
+
+
+def _file_details(
+    entry: _TreeEntry,
+    options: SnapshotOptions,
+    stats: SnapshotStats,
+    on_warning: Optional[WarningHandler],
+    hash_progress: Optional[_HashProgress],
+) -> str:
+    size_text = str(entry.size) if entry.size is not None else "?"
+    details = [f"size={size_text} B"]
+
+    if options.include_hash:
+        bytes_read = 0
+
+        def track_chunk(byte_count: int) -> None:
+            nonlocal bytes_read
+            bytes_read += byte_count
+            if hash_progress is not None:
+                hash_progress.advance_bytes(byte_count)
+
+        try:
+            details.append(f"sha256={_sha256(entry.path, track_chunk)}")
+        except OSError as exc:
+            details.append("sha256=unreadable")
+            _report_error(stats, on_warning, entry.path, str(exc))
+        finally:
+            if hash_progress is not None:
+                hash_progress.finish_file(entry.size, bytes_read)
+
+    return f" [{', '.join(details)}]"
+
+
 def _iter_directory(
     directory: Path,
     prefix: str,
@@ -126,6 +318,7 @@ def _iter_directory(
     stats: SnapshotStats,
     excluded_paths: set[str],
     on_warning: Optional[WarningHandler],
+    hash_progress: Optional[_HashProgress],
 ) -> Iterator[str]:
     entries = _read_entries(directory, options, stats, excluded_paths, on_warning)
     if entries is None:
@@ -148,10 +341,18 @@ def _iter_directory(
                 stats,
                 excluded_paths,
                 on_warning,
+                hash_progress,
             )
         elif entry.kind == "file":
             stats.files += 1
-            yield f"{prefix}{connector}{name}"
+            details = _file_details(
+                entry,
+                options,
+                stats,
+                on_warning,
+                hash_progress,
+            )
+            yield f"{prefix}{connector}{name}{details}"
         elif entry.kind == "link":
             stats.links += 1
             yield f"{prefix}{connector}{name} [link-not-followed]"
@@ -167,14 +368,27 @@ def iter_snapshot_lines(
     stats: SnapshotStats,
     excluded_paths: set[str],
     on_warning: Optional[WarningHandler] = None,
+    hash_progress: Optional[_HashProgress] = None,
 ) -> Iterator[str]:
     """Yield snapshot lines while updating stats."""
-    yield "# DirTree Snapshot v1"
+    yield "# DirTree Snapshot v2"
     mode = "directories-only" if options.directories_only else "files-and-directories"
+    details = "none" if options.directories_only else "size-bytes"
+    if options.include_hash:
+        details += ",sha256"
     yield f"# Mode: {mode}"
+    yield f"# Details: {details}"
     yield "# Paths: relative-to-root"
     yield "."
-    yield from _iter_directory(root, "", options, stats, excluded_paths, on_warning)
+    yield from _iter_directory(
+        root,
+        "",
+        options,
+        stats,
+        excluded_paths,
+        on_warning,
+        hash_progress,
+    )
     yield (
         "# Summary: "
         f"directories={stats.directories} files={stats.files} "
@@ -187,6 +401,7 @@ def write_snapshot(
     output: Path,
     options: SnapshotOptions,
     on_warning: Optional[WarningHandler] = None,
+    hash_progress: Optional[_HashProgress] = None,
 ) -> SnapshotStats:
     """Write a snapshot atomically and return its scan statistics."""
     root = _absolute_path(root)
@@ -224,6 +439,7 @@ def write_snapshot(
                 stats,
                 excluded_paths,
                 on_warning,
+                hash_progress,
             ):
                 output_file.write(line)
                 output_file.write("\n")
@@ -281,6 +497,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="include directories and links, but omit regular files",
     )
+    parser.add_argument(
+        "--hash",
+        action="store_true",
+        help="include SHA-256 hashes and show hashing progress",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
@@ -288,6 +509,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.dirs_only and args.hash:
+        parser.error("--hash cannot be combined with --dirs-only")
 
     directory_value = args.directory
     if directory_value is None:
@@ -317,18 +541,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         output = _absolute_path(default_output_path(root))
 
-    options = SnapshotOptions(directories_only=args.dirs_only)
+    options = SnapshotOptions(
+        directories_only=args.dirs_only,
+        include_hash=args.hash,
+    )
 
     print(f"Scanning: {root}")
 
+    hash_progress: Optional[_HashProgress] = None
+    if options.include_hash:
+        print("Counting files and bytes for hash progress...", file=sys.stderr)
+        totals = _measure_hash_work(root, {_path_key(output)})
+        hash_progress = _HashProgress(
+            totals=totals,
+            stream=sys.stderr,
+            enabled=sys.stderr.isatty(),
+        )
+        hash_progress.start()
+
     def show_warning(path: Path, message: str) -> None:
-        print(f"Warning: {path}: {message}", file=sys.stderr)
+        warning = f"Warning: {path}: {message}"
+        if hash_progress is not None:
+            hash_progress.message(warning)
+        else:
+            print(warning, file=sys.stderr)
 
     try:
-        stats = write_snapshot(root, output, options, show_warning)
+        stats = write_snapshot(
+            root,
+            output,
+            options,
+            show_warning,
+            hash_progress,
+        )
     except (OSError, ValueError) as exc:
+        if hash_progress is not None:
+            hash_progress.finish(completed=False)
         print(f"Error: could not create snapshot: {exc}", file=sys.stderr)
         return 1
+
+    if hash_progress is not None:
+        hash_progress.finish(completed=True)
 
     print(f"Snapshot written: {output}")
     print(
