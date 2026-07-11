@@ -4,11 +4,14 @@ setlocal EnableExtensions DisableDelayedExpansion
 set "pause_on_exit="
 set "interactive_mode="
 set "hash_argument="
+set "python_executable="
 
 if not "%~1"=="" goto use_arguments
 
 set "pause_on_exit=1"
 set "interactive_mode=1"
+cd /d "%~dp0"
+if errorlevel 1 goto working_directory_error
 echo DirTree Snapshot
 echo.
 set /p "scan_directory=Directory to scan: "
@@ -32,48 +35,59 @@ set "exit_code=2"
 goto finish
 
 :check_python
-where py >nul 2>nul
-if errorlevel 1 goto use_python
-py -3 -c "import sys" >nul 2>nul
-if errorlevel 1 goto use_python
-goto run_py
+if not exist "%~dp0dirtree.py" goto missing_script
 
-:use_python
-where python >nul 2>nul
+for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do if not defined python_executable set "python_executable=%%P"
+if not defined python_executable goto detect_python_command
+"%python_executable%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul
+if errorlevel 1 goto detect_python_command
+goto run_detected_python
+
+:detect_python_command
+set "python_executable="
+for /f "delims=" %%P in ('python -c "import sys; print(sys.executable)" 2^>nul') do if not defined python_executable set "python_executable=%%P"
+if not defined python_executable goto missing_python
+"%python_executable%" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul
 if errorlevel 1 goto missing_python
-python -c "import sys" >nul 2>nul
-if errorlevel 1 goto missing_python
-goto run_python
+goto run_detected_python
 
-:run_py
-if defined interactive_mode goto run_py_interactive
-py -3 "%~dp0dirtree.py" %scan_arguments%
+:run_detected_python
+echo Python executable: %python_executable%
+"%python_executable%" --version 2>&1
+if defined interactive_mode goto run_interactive
+"%python_executable%" -u "%~dp0dirtree.py" %scan_arguments% 2>&1
 set "exit_code=%errorlevel%"
+if not "%exit_code%"=="0" echo [ERROR] dirtree.py exited with code %exit_code%.
 goto finish
 
-:run_py_interactive
-py -3 "%~dp0dirtree.py" "%scan_directory%" %hash_argument%
+:run_interactive
+if defined hash_argument echo SHA-256 hashing: enabled
+if not defined hash_argument echo SHA-256 hashing: disabled
+"%python_executable%" -u "%~dp0dirtree.py" "%scan_directory%" %hash_argument% 2>&1
 set "exit_code=%errorlevel%"
+if not "%exit_code%"=="0" echo [ERROR] dirtree.py exited with code %exit_code%.
 goto finish
 
-:run_python
-if defined interactive_mode goto run_python_interactive
-python "%~dp0dirtree.py" %scan_arguments%
-set "exit_code=%errorlevel%"
+:working_directory_error
+echo.
+echo [ERROR] Could not use the launcher directory:
+echo %~dp0
+set "exit_code=3"
 goto finish
 
-:run_python_interactive
-python "%~dp0dirtree.py" "%scan_directory%" %hash_argument%
-set "exit_code=%errorlevel%"
+:missing_script
+echo.
+echo [ERROR] Required file was not found:
+echo %~dp0dirtree.py
+set "exit_code=2"
 goto finish
 
 :missing_python
 echo.
-echo [ERROR] Python 3.9 or newer could not be started.
+echo [ERROR] Python 3.9 or newer could not be found.
 echo Install Python from https://www.python.org/downloads/windows/
 echo Then open a new CMD and run: py -3 --version
 set "exit_code=9009"
-
 goto finish
 
 :finish

@@ -1434,6 +1434,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     print(f"Scanning: {root}")
+    print(f"Output format: {options.output_format}")
+    print(f"SHA-256: {'enabled' if options.include_hash else 'disabled'}")
+    print(f"Output file: {output}")
 
     hash_progress: Optional[_HashProgress] = None
     if options.include_hash:
