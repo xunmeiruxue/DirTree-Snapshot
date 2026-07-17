@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+"""Compare DirTree Snapshot files and render readable reports."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import os
+import re
+import sys
+import tempfile
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Iterator, Optional, Sequence
+
+COMPARE_FORMAT_VERSION = 1
+_HASH_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+_FILE_DETAILS_PATTERN = re.compile(
+    r" \[size=(?P<size>\d+|\?) B(?:, sha256=(?P<hash>[0-9a-fA-F]{64}|unreadable))?\]$"
+)
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_STATUS_ORDER = {"changed": 0, "removed": 1, "added": 2, "same": 3}
+_KIND_LABELS = {
+    "directory": "目录",
+    "file": "文件",
+    "link": "链接",
+    "special": "特殊文件",
+    "unreadable": "无法读取",
+}
+_STATUS_LABELS = {
+    "added": "新增",
+    "removed": "缺失",
+    "changed": "已更改",
+    "same": "相同",
+}
+
+
+@dataclass(frozen=True)
+class ManifestEntry:
+    path: str
+    kind: str
+    size: Optional[int] = None
+    sha256: Optional[str] = None
+
+
+@dataclass
+class SnapshotData:
+    source_name: str
+    source_format: str
+    entries: list[ManifestEntry]
+    warnings: list[str]
+
+
+@dataclass(frozen=True)
+class ComparisonRow:
+    status: str
+    path: str
+    kind: str
+    left: Optional[ManifestEntry]
+    right: Optional[ManifestEntry]
+    details: tuple[str, ...]
+    hash_verified: bool = False
+
+
+@dataclass
+class ComparisonResult:
+    rows: list[ComparisonRow]
+    counts: dict[str, int]
+    hash_verified: int
+    unverified_files: int
+    warnings: list[str]
+
+    @property
+    def differences(self) -> int:
+        return self.counts["added"] + self.counts["removed"] + self.counts["changed"]
+
+
+class _SnapshotHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.entries: list[ManifestEntry] = []
+        self.warnings: list[str] = []
+        self.recognized = False
+        self._items: list[dict[str, object]] = []
+        self._hash_target: Optional[dict[str, object]] = None
+        self._hash_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attributes = {name: value or "" for name, value in attrs}
+        classes = set(attributes.get("class", "").split())
+
+        if tag == "li" and "tree-item" in classes:
+            self.recognized = True
+            kind = attributes.get("data-kind") or self._kind_from_classes(classes)
+            size = self._parse_size(attributes.get("data-size"))
+            context: dict[str, object] = {
+                "path": attributes.get("data-search", ""),
+                "kind": kind,
+                "size": size,
+                "sha256": attributes.get("data-sha256") or None,
+                "root": "root-item" in classes,
+            }
+            self._items.append(context)
+            return
+
+        if not self._items:
+            return
+
+        if tag == "span" and "node-size" in classes:
+            size = self._parse_size(attributes.get("data-bytes"))
+            if size is not None:
+                self._items[-1]["size"] = size
+        elif tag == "code" and "hash-value" in classes:
+            self._hash_target = self._items[-1]
+            self._hash_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._hash_target is not None:
+            self._hash_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "code" and self._hash_target is not None:
+            hash_value = "".join(self._hash_parts).strip()
+            if hash_value:
+                self._hash_target["sha256"] = hash_value
+            self._hash_target = None
+            self._hash_parts = []
+            return
+
+        if tag != "li" or not self._items:
+            return
+
+        context = self._items.pop()
+        if context["root"]:
+            return
+        path = _normalize_path(str(context["path"]))
+        if not path:
+            return
+        self.entries.append(
+            ManifestEntry(
+                path=path,
+                kind=str(context["kind"]),
+                size=context["size"] if isinstance(context["size"], int) else None,
+                sha256=str(context["sha256"]) if context["sha256"] else None,
+            )
+        )
+
+    @staticmethod
+    def _kind_from_classes(classes: set[str]) -> str:
+        if "directory-item" in classes:
+            return "directory"
+        if "file-item" in classes:
+            return "file"
+        if "link-item" in classes:
+            return "link"
+        return "unreadable"
+
+    @staticmethod
+    def _parse_size(value: Optional[str]) -> Optional[int]:
+        if value and value.isdigit():
+            return int(value)
+        return None
+
+
+def _normalize_path(value: str) -> str:
+    normalized = value.replace("\\", "/").strip("/")
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
+    return normalized
+
+
+def _parse_html_snapshot(path: Path, content: str) -> SnapshotData:
+    parser = _SnapshotHTMLParser()
+    parser.feed(content)
+    parser.close()
+    if not parser.recognized:
+        raise ValueError(f"Not a supported DirTree HTML snapshot: {path.name}")
+    return SnapshotData(
+        source_name=path.name,
+        source_format="html",
+        entries=parser.entries,
+        warnings=parser.warnings,
+    )
+
+
+def _parse_text_snapshot(path: Path, content: str) -> SnapshotData:
+    lines = content.splitlines()
+    if not lines or not lines[0].startswith("# DirTree Snapshot"):
+        raise ValueError(f"Not a supported DirTree text snapshot: {path.name}")
+
+    entries: list[ManifestEntry] = []
+    warnings: list[str] = []
+    directory_stack: list[str] = []
+    last_connector = chr(96) + "-- "
+
+    for line_number, line in enumerate(lines[1:], start=2):
+        if not line or line == "." or line.startswith("#"):
+            continue
+
+        remainder = line
+        depth = 0
+        while remainder.startswith("|   ") or remainder.startswith("    "):
+            remainder = remainder[4:]
+            depth += 1
+
+        if remainder.startswith("|-- "):
+            label = remainder[4:]
+        elif remainder.startswith(last_connector):
+            label = remainder[4:]
+        else:
+            warnings.append(f"第 {line_number} 行无法识别，已跳过")
+            continue
+
+        directory_stack = directory_stack[:depth]
+        if label == "[unreadable]":
+            warnings.append(f"第 {line_number} 行标记为无法读取")
+            continue
+
+        if label.endswith("/"):
+            name = label[:-1]
+            entry_path = _normalize_path("/".join(directory_stack + [name]))
+            entries.append(ManifestEntry(path=entry_path, kind="directory"))
+            directory_stack.append(name)
+            continue
+
+        kind = "file"
+        size: Optional[int] = None
+        sha256: Optional[str] = None
+
+        if label.endswith(" [link-not-followed]"):
+            name = label[: -len(" [link-not-followed]")]
+            kind = "link"
+        elif label.endswith(" [special-file]"):
+            name = label[: -len(" [special-file]")]
+            kind = "special"
+        elif label.endswith(" [unreadable]"):
+            name = label[: -len(" [unreadable]")]
+            kind = "unreadable"
+        else:
+            match = _FILE_DETAILS_PATTERN.search(label)
+            if match:
+                name = label[: match.start()]
+                size_text = match.group("size")
+                size = int(size_text) if size_text.isdigit() else None
+                sha256 = match.group("hash")
+            else:
+                name = label
+
+        entry_path = _normalize_path("/".join(directory_stack + [name]))
+        entries.append(
+            ManifestEntry(path=entry_path, kind=kind, size=size, sha256=sha256)
+        )
+
+    return SnapshotData(
+        source_name=path.name,
+        source_format="text",
+        entries=entries,
+        warnings=warnings,
+    )
+
+
+def load_snapshot(path: Path) -> SnapshotData:
+    path = Path(os.path.abspath(os.fspath(path)))
+    if not path.is_file():
+        raise ValueError(f"Snapshot file does not exist: {path}")
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read snapshot {path.name}: {exc}") from exc
+
+    stripped = content.lstrip()
+    if stripped.lower().startswith("<!doctype html") or stripped.lower().startswith("<html"):
+        return _parse_html_snapshot(path, content)
+    return _parse_text_snapshot(path, content)
+
+
+def _usable_hash(value: Optional[str]) -> bool:
+    return bool(value and _HASH_PATTERN.fullmatch(value))
+
+
+def _index_entries(
+    snapshot: SnapshotData,
+    case_sensitive: bool,
+) -> tuple[dict[str, ManifestEntry], list[str]]:
+    indexed: dict[str, ManifestEntry] = {}
+    warnings: list[str] = []
+    for entry in snapshot.entries:
+        key = entry.path if case_sensitive else entry.path.casefold()
+        if key in indexed:
+            warnings.append(
+                f"{snapshot.source_name} 中存在重复路径：{indexed[key].path} / {entry.path}"
+            )
+            continue
+        indexed[key] = entry
+    return indexed, warnings
+
+
+def compare_snapshots(
+    left_snapshot: SnapshotData,
+    right_snapshot: SnapshotData,
+    case_sensitive: bool = False,
+) -> ComparisonResult:
+    left_entries, left_warnings = _index_entries(left_snapshot, case_sensitive)
+    right_entries, right_warnings = _index_entries(right_snapshot, case_sensitive)
+    rows: list[ComparisonRow] = []
+    hash_verified = 0
+    unverified_files = 0
+
+    for key in sorted(set(left_entries) | set(right_entries), key=str.casefold):
+        left = left_entries.get(key)
+        right = right_entries.get(key)
+
+        if left is None and right is not None:
+            rows.append(
+                ComparisonRow(
+                    status="added",
+                    path=right.path,
+                    kind=right.kind,
+                    left=None,
+                    right=right,
+                    details=("仅存在于右侧清单",),
+                )
+            )
+            continue
+
+        if right is None and left is not None:
+            rows.append(
+                ComparisonRow(
+                    status="removed",
+                    path=left.path,
+                    kind=left.kind,
+                    left=left,
+                    right=None,
+                    details=("仅存在于左侧清单",),
+                )
+            )
+            continue
+
+        assert left is not None and right is not None
+        changes: list[str] = []
+        notes: list[str] = []
+        verified = False
+
+        if left.path != right.path:
+            changes.append("路径大小写不同")
+        if left.kind != right.kind:
+            changes.append(
+                f"类型不同：{_KIND_LABELS.get(left.kind, left.kind)} -> "
+                f"{_KIND_LABELS.get(right.kind, right.kind)}"
+            )
+        elif left.kind == "file":
+            if left.size is not None and right.size is not None:
+                if left.size != right.size:
+                    changes.append(f"大小不同：{left.size} B -> {right.size} B")
+            else:
+                notes.append("至少一侧未记录文件大小")
+
+            if _usable_hash(left.sha256) and _usable_hash(right.sha256):
+                verified = True
+                hash_verified += 1
+                if left.sha256.lower() != right.sha256.lower():
+                    changes.append("SHA-256 不同")
+                else:
+                    notes.append("SHA-256 一致")
+            else:
+                unverified_files += 1
+                if left.sha256 == "unreadable" or right.sha256 == "unreadable":
+                    notes.append("至少一侧哈希无法读取")
+                else:
+                    notes.append("未进行双侧 SHA-256 校验")
+        elif left.kind == "directory":
+            notes.append("目录存在于两侧")
+        elif left.kind == "link":
+            notes.append("链接存在于两侧")
+
+        status = "changed" if changes else "same"
+        detail_values = tuple(changes if changes else notes or ["项目一致"])
+        rows.append(
+            ComparisonRow(
+                status=status,
+                path=right.path,
+                kind=right.kind,
+                left=left,
+                right=right,
+                details=detail_values,
+                hash_verified=verified,
+            )
+        )
+
+    rows.sort(key=lambda row: (_STATUS_ORDER[row.status], row.path.casefold(), row.path))
+    counts = {status: 0 for status in _STATUS_ORDER}
+    for row in rows:
+        counts[row.status] += 1
+
+    warnings = (
+        list(left_snapshot.warnings)
+        + list(right_snapshot.warnings)
+        + left_warnings
+        + right_warnings
+    )
+    return ComparisonResult(
+        rows=rows,
+        counts=counts,
+        hash_verified=hash_verified,
+        unverified_files=unverified_files,
+        warnings=warnings,
+    )
+
+
+def _safe_output_stem(path: Path) -> str:
+    value = path.stem
+    for suffix in ("-tree", "_tree", "-snapshot", "_snapshot"):
+        if value.lower().endswith(suffix):
+            value = value[: -len(suffix)]
+            break
+    value = _INVALID_FILENAME_CHARS.sub("_", value).strip(". ")
+    return value or "snapshot"
+
+
+def default_compare_output(left: Path, right: Path, output_format: str) -> Path:
+    extension = "html" if output_format == "html" else "txt"
+    filename = f"{_safe_output_stem(left)}-vs-{_safe_output_stem(right)}-diff.{extension}"
+    return Path.cwd() / filename
+
+
+def _format_entry_text(entry: Optional[ManifestEntry]) -> str:
+    if entry is None:
+        return "-"
+    values = [_KIND_LABELS.get(entry.kind, entry.kind)]
+    if entry.kind == "file":
+        values.append(f"size={entry.size if entry.size is not None else '?'} B")
+        if entry.sha256:
+            values.append(f"sha256={entry.sha256}")
+    return ", ".join(values)
+
+
+def iter_text_report(
+    left: SnapshotData,
+    right: SnapshotData,
+    result: ComparisonResult,
+    include_unchanged: bool,
+) -> Iterator[str]:
+    yield f"# DirTree Comparison v{COMPARE_FORMAT_VERSION}"
+    yield f"# Left: {left.source_name}"
+    yield f"# Right: {right.source_name}"
+    yield (
+        "# Summary: "
+        f"changed={result.counts['changed']} added={result.counts['added']} "
+        f"removed={result.counts['removed']} same={result.counts['same']} "
+        f"hash-verified={result.hash_verified}"
+    )
+    yield ""
+
+    for row in result.rows:
+        if row.status == "same" and not include_unchanged:
+            continue
+        yield f"[{row.status.upper()}] {row.path}"
+        yield f"  left:  {_format_entry_text(row.left)}"
+        yield f"  right: {_format_entry_text(row.right)}"
+        for detail in row.details:
+            yield f"  detail: {detail}"
+        yield ""
+
+    if result.warnings:
+        yield "# Warnings"
+        for warning in result.warnings:
+            yield f"- {warning}"
+
+
+_COMPARE_STYLE = """
+:root {
+  color-scheme: light;
+  --page: #f3f5f6;
+  --surface: #ffffff;
+  --surface-muted: #f8fafb;
+  --text: #172229;
+  --muted: #65747c;
+  --line: #d7e0e4;
+  --line-strong: #b9c6cc;
+  --accent: #1769aa;
+  --accent-soft: #e7f1f8;
+  --added: #287a50;
+  --added-soft: #edf8f1;
+  --removed: #b33c3c;
+  --removed-soft: #fdf0f0;
+  --changed: #a96608;
+  --changed-soft: #fff7e8;
+  --same: #60717a;
+  --same-soft: #f0f3f4;
+  --warning: #85560a;
+  --warning-soft: #fff5dc;
+  --shadow: 0 12px 30px rgba(23, 34, 41, 0.08);
+}
+
+* { box-sizing: border-box; }
+html { background: var(--page); }
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--page);
+  color: var(--text);
+  font-family: Inter, "Segoe UI", "Microsoft YaHei UI", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+button, input, select { font: inherit; letter-spacing: 0; }
+.header-inner, .page-main, .page-footer {
+  width: min(1240px, calc(100% - 40px));
+  margin: 0 auto;
+}
+.page-header { border-bottom: 1px solid var(--line); background: var(--surface); }
+.header-inner { padding: 24px 0 20px; }
+.product-name { margin: 0 0 5px; color: var(--accent); font-size: 13px; font-weight: 700; }
+h1 { margin: 0; font-size: 28px; font-weight: 680; line-height: 1.2; letter-spacing: 0; }
+.snapshot-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin-top: 18px;
+}
+.snapshot-name {
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-muted);
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+.snapshot-arrow { color: var(--muted); text-align: center; font-weight: 700; }
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin: 22px 0 0;
+  border-top: 1px solid var(--line);
+}
+.metric { padding: 13px 16px 0; border-left: 1px solid var(--line); }
+.metric:first-child { border-left: 0; }
+.metric dt { color: var(--muted); font-size: 12px; }
+.metric dd { margin: 2px 0 0; font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.metric-added dd { color: var(--added); }
+.metric-removed dd { color: var(--removed); }
+.metric-changed dd { color: var(--changed); }
+.page-main { padding: 26px 0 36px; }
+.notice {
+  margin-bottom: 14px;
+  padding: 10px 13px;
+  border: 1px solid #e4c986;
+  border-radius: 6px;
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.report-panel {
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 190px auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-muted);
+}
+.toolbar input, .toolbar select {
+  width: 100%;
+  height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  outline: none;
+  background: var(--surface);
+  color: var(--text);
+}
+.toolbar input:focus, .toolbar select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.match-count { min-width: 72px; color: var(--muted); text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
+.table-scroll { overflow: auto; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-strong);
+  background: #f5f8f9;
+  color: var(--muted);
+  text-align: left;
+  font-size: 12px;
+  font-weight: 700;
+}
+td { padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tbody tr:hover { background: var(--surface-muted); }
+th:nth-child(1) { width: 84px; }
+th:nth-child(2) { width: 34%; }
+th:nth-child(3) { width: 90px; }
+th:nth-child(4), th:nth-child(5) { width: 23%; }
+.status-badge {
+  display: inline-block;
+  min-width: 52px;
+  padding: 2px 6px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 700;
+}
+.status-added { color: var(--added); background: var(--added-soft); }
+.status-removed { color: var(--removed); background: var(--removed-soft); }
+.status-changed { color: var(--changed); background: var(--changed-soft); }
+.status-same { color: var(--same); background: var(--same-soft); }
+.path-value { display: block; overflow-wrap: anywhere; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+.reason { margin-top: 5px; color: var(--muted); font-size: 12px; }
+.kind-value { color: var(--muted); }
+.metadata { display: grid; gap: 5px; }
+.size-value { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; font-variant-numeric: tabular-nums; }
+.hash-details summary { color: var(--accent); cursor: pointer; font-size: 11px; }
+.hash-value { display: block; margin-top: 4px; overflow-wrap: anywhere; color: #285944; font-family: "Cascadia Mono", Consolas, monospace; font-size: 10px; }
+.no-value { color: #9aa6ac; }
+[hidden] { display: none !important; }
+.page-footer { display: flex; justify-content: space-between; gap: 20px; padding: 0 0 25px; color: var(--muted); font-size: 12px; }
+
+@media (max-width: 760px) {
+  .header-inner, .page-main, .page-footer { width: min(100% - 24px, 1240px); }
+  h1 { font-size: 24px; }
+  .snapshot-pair { grid-template-columns: 1fr; }
+  .snapshot-arrow { transform: rotate(90deg); }
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric { border-left: 0; border-bottom: 1px solid var(--line); }
+  .toolbar { grid-template-columns: 1fr; }
+  .match-count { text-align: left; }
+  .table-scroll { overflow: visible; }
+  table, tbody, tr, td { display: block; width: 100%; }
+  thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+  tbody tr { padding: 10px 12px; border-bottom: 1px solid var(--line-strong); }
+  td { display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 8px; padding: 5px 0; border: 0; }
+  td::before { content: attr(data-label); color: var(--muted); font-size: 11px; font-weight: 700; }
+}
+
+@media print {
+  :root { --page: #ffffff; --shadow: none; }
+  .toolbar { display: none; }
+  .report-panel { box-shadow: none; }
+  tr[hidden] { display: table-row !important; }
+}
+"""
+
+
+_COMPARE_SCRIPT = """
+<script>
+(function () {
+  "use strict";
+  var search = document.getElementById("diff-search");
+  var filter = document.getElementById("status-filter");
+  var count = document.getElementById("match-count");
+  var rows = Array.prototype.slice.call(document.querySelectorAll("tbody tr"));
+
+  function applyFilters() {
+    var query = search.value.trim().toLocaleLowerCase();
+    var status = filter.value;
+    var visible = 0;
+    rows.forEach(function (row) {
+      var rowStatus = row.getAttribute("data-status");
+      var statusMatch = status === "all" || (status === "differences" ? rowStatus !== "same" : rowStatus === status);
+      var searchMatch = !query || (row.getAttribute("data-search") || "").toLocaleLowerCase().indexOf(query) !== -1;
+      row.hidden = !(statusMatch && searchMatch);
+      if (!row.hidden) visible += 1;
+    });
+    count.textContent = visible + " 项";
+  }
+
+  search.addEventListener("input", applyFilters);
+  search.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") {
+      search.value = "";
+      applyFilters();
+      search.blur();
+    }
+  });
+  filter.addEventListener("change", applyFilters);
+  filter.value = document.body.getAttribute("data-initial-filter") || "differences";
+  applyFilters();
+}());
+</script>
+"""
+
+
+def _format_size(value: Optional[int]) -> str:
+    return f"{value:,} B" if value is not None else "未记录"
+
+
+def _entry_html(entry: Optional[ManifestEntry]) -> str:
+    if entry is None:
+        return '<span class="no-value">-</span>'
+    if entry.kind != "file":
+        return f'<span class="kind-value">{html.escape(_KIND_LABELS.get(entry.kind, entry.kind))}</span>'
+
+    parts = ['<div class="metadata">', f'<span class="size-value">{_format_size(entry.size)}</span>']
+    if entry.sha256:
+        hash_value = html.escape(entry.sha256)
+        parts.append(
+            '<details class="hash-details"><summary>SHA-256</summary>'
+            f'<code class="hash-value">{hash_value}</code></details>'
+        )
+    else:
+        parts.append('<span class="no-value">未记录哈希</span>')
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def iter_html_report(
+    left: SnapshotData,
+    right: SnapshotData,
+    result: ComparisonResult,
+    include_unchanged: bool,
+) -> Iterator[str]:
+    initial_filter = "all" if include_unchanged else "differences"
+    yield "<!doctype html>"
+    yield '<html lang="zh-CN">'
+    yield "<head>"
+    yield '  <meta charset="utf-8">'
+    yield '  <meta name="viewport" content="width=device-width, initial-scale=1">'
+    yield "  <title>清单差异报告 - DirTree Snapshot</title>"
+    yield "  <style>"
+    yield _COMPARE_STYLE
+    yield "  </style>"
+    yield "</head>"
+    yield f'<body data-initial-filter="{initial_filter}">'
+    yield '<header class="page-header"><div class="header-inner">'
+    yield '  <p class="product-name">DirTree Snapshot</p>'
+    yield "  <h1>清单差异报告</h1>"
+    yield '  <div class="snapshot-pair">'
+    yield f'    <div class="snapshot-name">{html.escape(left.source_name)}</div>'
+    yield '    <div class="snapshot-arrow">-&gt;</div>'
+    yield f'    <div class="snapshot-name">{html.escape(right.source_name)}</div>'
+    yield "  </div>"
+    yield '  <dl class="metrics" aria-label="差异统计">'
+    yield f'    <div class="metric metric-changed"><dt>已更改</dt><dd>{result.counts["changed"]}</dd></div>'
+    yield f'    <div class="metric metric-added"><dt>新增</dt><dd>{result.counts["added"]}</dd></div>'
+    yield f'    <div class="metric metric-removed"><dt>缺失</dt><dd>{result.counts["removed"]}</dd></div>'
+    yield f'    <div class="metric"><dt>相同</dt><dd>{result.counts["same"]}</dd></div>'
+    yield f'    <div class="metric"><dt>哈希已核验</dt><dd>{result.hash_verified}</dd></div>'
+    yield "  </dl>"
+    yield "</div></header>"
+    yield '<main class="page-main">'
+    if result.unverified_files:
+        yield (
+            '<div class="notice">'
+            f"有 {result.unverified_files} 个同路径文件未同时包含可用 SHA-256；"
+            "这些文件仅根据路径、类型和大小判断。"
+            "</div>"
+        )
+    for warning in result.warnings:
+        yield f'<div class="notice">{html.escape(warning)}</div>'
+    yield '<section class="report-panel" aria-label="差异列表">'
+    yield '  <div class="toolbar">'
+    yield '    <input id="diff-search" type="search" autocomplete="off" placeholder="搜索相对路径">'
+    yield '    <select id="status-filter" aria-label="状态筛选">'
+    yield '      <option value="differences">仅差异</option>'
+    yield '      <option value="all">全部项目</option>'
+    yield '      <option value="changed">已更改</option>'
+    yield '      <option value="added">新增</option>'
+    yield '      <option value="removed">缺失</option>'
+    yield '      <option value="same">相同</option>'
+    yield "    </select>"
+    yield '    <output id="match-count" class="match-count" aria-live="polite"></output>'
+    yield "  </div>"
+    yield '  <div class="table-scroll"><table>'
+    yield "    <thead><tr><th>状态</th><th>相对路径</th><th>类型</th><th>左侧</th><th>右侧</th></tr></thead>"
+    yield "    <tbody>"
+
+    for row in result.rows:
+        search_value = html.escape(row.path, quote=True)
+        status_label = _STATUS_LABELS[row.status]
+        kind_label = _KIND_LABELS.get(row.kind, row.kind)
+        detail_html = "；".join(html.escape(detail) for detail in row.details)
+        yield f'      <tr data-status="{row.status}" data-search="{search_value}">'
+        yield (
+            f'        <td data-label="状态"><span class="status-badge status-{row.status}">'
+            f"{status_label}</span></td>"
+        )
+        yield (
+            f'        <td data-label="相对路径"><code class="path-value">{html.escape(row.path)}</code>'
+            f'<div class="reason">{detail_html}</div></td>'
+        )
+        yield f'        <td data-label="类型"><span class="kind-value">{html.escape(kind_label)}</span></td>'
+        yield f'        <td data-label="左侧">{_entry_html(row.left)}</td>'
+        yield f'        <td data-label="右侧">{_entry_html(row.right)}</td>'
+        yield "      </tr>"
+
+    yield "    </tbody>"
+    yield "  </table></div>"
+    yield "</section>"
+    yield "</main>"
+    yield '<footer class="page-footer">'
+    yield f"  <span>Comparison format v{COMPARE_FORMAT_VERSION}</span>"
+    yield f"  <span>差异 {result.differences} 项</span>"
+    yield "</footer>"
+    yield _COMPARE_SCRIPT
+    yield "</body>"
+    yield "</html>"
+
+
+def _write_report(path: Path, lines: Iterator[str]) -> None:
+    path = Path(os.path.abspath(os.fspath(path)))
+    if not path.parent.is_dir():
+        raise ValueError(f"Output directory does not exist: {path.parent}")
+
+    descriptor = -1
+    temporary_path: Optional[Path] = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".dirtree-compare-",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8-sig", newline="\n") as output:
+            descriptor = -1
+            for line in lines:
+                output.write(line)
+                output.write("\n")
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def build_compare_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="dirtree compare",
+        description="Compare two DirTree Snapshot HTML or text files.",
+    )
+    parser.add_argument("left", help="source or earlier snapshot")
+    parser.add_argument("right", help="backup or later snapshot")
+    parser.add_argument("-o", "--output", help="comparison report output file")
+    parser.add_argument(
+        "--format",
+        choices=("html", "text"),
+        help="report format; inferred from .txt, otherwise defaults to html",
+    )
+    parser.add_argument(
+        "--include-unchanged",
+        action="store_true",
+        help="show unchanged items initially and include them in text reports",
+    )
+    parser.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="compare relative paths with case sensitivity",
+    )
+    return parser
+
+
+def run_compare(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_compare_parser()
+    args = parser.parse_args(argv)
+    left_path = Path(os.path.expandvars(os.path.expanduser(args.left.strip('"'))))
+    right_path = Path(os.path.expandvars(os.path.expanduser(args.right.strip('"'))))
+
+    try:
+        left = load_snapshot(left_path)
+        right = load_snapshot(right_path)
+        result = compare_snapshots(left, right, case_sensitive=args.case_sensitive)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    output: Optional[Path] = None
+    if args.output:
+        output = Path(os.path.expandvars(os.path.expanduser(args.output.strip('"'))))
+
+    output_format = args.format
+    if output_format is None:
+        output_format = "text" if output is not None and output.suffix.lower() == ".txt" else "html"
+    if output is None:
+        output = default_compare_output(left_path, right_path, output_format)
+
+    absolute_output = Path(os.path.abspath(os.fspath(output)))
+    input_keys = {
+        os.path.normcase(os.path.abspath(os.fspath(left_path))),
+        os.path.normcase(os.path.abspath(os.fspath(right_path))),
+    }
+    if os.path.normcase(os.fspath(absolute_output)) in input_keys:
+        print("Error: comparison output cannot overwrite an input snapshot", file=sys.stderr)
+        return 2
+
+    if output_format == "html":
+        lines = iter_html_report(left, right, result, args.include_unchanged)
+    else:
+        lines = iter_text_report(left, right, result, args.include_unchanged)
+
+    try:
+        _write_report(absolute_output, lines)
+    except (OSError, ValueError) as exc:
+        print(f"Error: could not write comparison report: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Left snapshot: {left.source_name} ({len(left.entries)} entries)")
+    print(f"Right snapshot: {right.source_name} ({len(right.entries)} entries)")
+    print(f"Changed: {result.counts['changed']}")
+    print(f"Added: {result.counts['added']}")
+    print(f"Removed: {result.counts['removed']}")
+    print(f"Same: {result.counts['same']}")
+    print(f"SHA-256 verified: {result.hash_verified}")
+    print(f"Comparison report: {absolute_output}")
+    for warning in result.warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+    return 0

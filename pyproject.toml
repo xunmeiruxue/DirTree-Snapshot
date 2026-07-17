@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dirtree-snapshot"
-version = "0.3.0"
-description = "Generate readable HTML and deterministic text directory snapshots"
+version = "0.4.0"
+description = "Generate and compare readable directory snapshots"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -22,4 +22,4 @@ classifiers = [
 dirtree = "dirtree:main"
 
 [tool.setuptools]
-py-modules = ["dirtree"]
+py-modules = ["dirtree", "dirtree_compare"]

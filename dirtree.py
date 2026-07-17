@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence, TextIO
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HASH_CHUNK_SIZE = 1024 * 1024
 PROGRESS_REFRESH_SECONDS = 0.1
 WarningHandler = Callable[[Path, str], None]
@@ -1055,7 +1055,7 @@ def _iter_html_directory(
     if entries is None:
         search_path = _html_search_path(path_parts + ("unreadable",))
         yield (
-            f'{indent}<li class="tree-item status-item" data-search="{search_path}">'
+            f'{indent}<li class="tree-item status-item" data-kind="unreadable" data-search="{search_path}">'
             f'<div class="node-row status-row"><span class="chevron-spacer"></span>'
             f'{_html_icon("alert", "node-icon alert-icon")}<span class="node-name">无法读取</span>'
             '<span class="node-size">error</span></div></li>'
@@ -1070,7 +1070,7 @@ def _iter_html_directory(
         if entry.kind == "directory":
             stats.directories += 1
             open_attribute = " open" if depth <= 1 else ""
-            yield f'{indent}<li class="tree-item directory-item" data-search="{search_path}">'
+            yield f'{indent}<li class="tree-item directory-item" data-kind="directory" data-search="{search_path}">'
             yield f'{indent}  <details{open_attribute}>'
             yield (
                 f'{indent}    <summary class="node-row">'
@@ -1103,7 +1103,11 @@ def _iter_html_directory(
             )
             size_label = f"{details.size:,} B" if details.size is not None else "未知"
             size_value = str(details.size) if details.size is not None else ""
-            yield f'{indent}<li class="tree-item file-item" data-search="{search_path}">'
+            hash_attribute = html.escape(details.sha256 or "", quote=True)
+            yield (
+                f'{indent}<li class="tree-item file-item" data-kind="file" '
+                f'data-size="{size_value}" data-sha256="{hash_attribute}" data-search="{search_path}">'
+            )
             yield (
                 f'{indent}  <div class="node-row"><span class="chevron-spacer"></span>'
                 f'{_html_icon("file", "node-icon file-icon")}'
@@ -1121,21 +1125,21 @@ def _iter_html_directory(
         elif entry.kind == "link":
             stats.links += 1
             yield (
-                f'{indent}<li class="tree-item link-item" data-search="{search_path}">'
+                f'{indent}<li class="tree-item link-item" data-kind="link" data-search="{search_path}">'
                 f'<div class="node-row"><span class="chevron-spacer"></span>'
                 f'{_html_icon("link", "node-icon link-icon")}<span class="node-name">{name}'
                 '<span class="node-badge">链接，未跟随</span></span><span></span></div></li>'
             )
         elif entry.kind == "other":
             yield (
-                f'{indent}<li class="tree-item status-item" data-search="{search_path}">'
+                f'{indent}<li class="tree-item status-item" data-kind="special" data-search="{search_path}">'
                 f'<div class="node-row"><span class="chevron-spacer"></span>'
                 f'{_html_icon("alert", "node-icon alert-icon")}<span class="node-name">{name}'
                 '<span class="node-badge">特殊文件</span></span><span></span></div></li>'
             )
         else:
             yield (
-                f'{indent}<li class="tree-item status-item" data-search="{search_path}">'
+                f'{indent}<li class="tree-item status-item" data-kind="unreadable" data-search="{search_path}">'
                 f'<div class="node-row status-row"><span class="chevron-spacer"></span>'
                 f'{_html_icon("alert", "node-icon alert-icon")}<span class="node-name">{name}'
                 '<span class="node-badge">无法读取</span></span><span></span></div></li>'
@@ -1204,7 +1208,7 @@ def iter_snapshot_html(
     yield "    </div>"
     yield '    <div class="tree-scroll">'
     yield '      <ul class="tree tree-root">'
-    yield f'        <li class="tree-item directory-item root-item" data-search="{root_search}">'
+    yield f'        <li class="tree-item directory-item root-item" data-kind="root" data-search="{root_search}">'
     yield "          <details open>"
     yield '            <summary class="node-row">'
     yield _html_icon("chevron-right", "chevron")
@@ -1246,7 +1250,7 @@ def iter_snapshot_html(
     )
     yield f'<script id="snapshot-stats" type="application/json">{stats_json}</script>'
     yield '<footer class="page-footer">'
-    yield '  <span>Snapshot format v2</span>'
+    yield '  <span>Snapshot format v3</span>'
     yield f"  <span>{mode_label}</span>"
     yield "</footer>"
     yield _HTML_SCRIPT
@@ -1352,6 +1356,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Create a deterministic directory tree snapshot for a single folder."
         ),
+        epilog="Compare snapshots: dirtree compare LEFT RIGHT",
     )
     parser.add_argument(
         "directory",
@@ -1384,8 +1389,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0].casefold() == "compare":
+        from dirtree_compare import run_compare
+
+        return run_compare(arguments[1:])
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
 
     if args.dirs_only and args.hash:
         parser.error("--hash cannot be combined with --dirs-only")
