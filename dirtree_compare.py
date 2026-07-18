@@ -10,6 +10,7 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
@@ -50,6 +51,7 @@ class SnapshotData:
     source_format: str
     entries: list[ManifestEntry]
     warnings: list[str]
+    created_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ class _SnapshotHTMLParser(HTMLParser):
         self.entries: list[ManifestEntry] = []
         self.warnings: list[str] = []
         self.recognized = False
+        self.created_at: Optional[str] = None
         self._items: list[dict[str, object]] = []
         self._hash_target: Optional[dict[str, object]] = None
         self._hash_parts: list[str] = []
@@ -89,6 +92,9 @@ class _SnapshotHTMLParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         attributes = {name: value or "" for name, value in attrs}
         classes = set(attributes.get("class", "").split())
+
+        if tag == "time" and "snapshot-time" in classes:
+            self.created_at = attributes.get("data-created-at") or attributes.get("datetime") or None
 
         if tag == "li" and "tree-item" in classes:
             self.recognized = True
@@ -181,6 +187,7 @@ def _parse_html_snapshot(path: Path, content: str) -> SnapshotData:
         source_format="html",
         entries=parser.entries,
         warnings=parser.warnings,
+        created_at=parser.created_at,
     )
 
 
@@ -191,6 +198,10 @@ def _parse_text_snapshot(path: Path, content: str) -> SnapshotData:
 
     entries: list[ManifestEntry] = []
     warnings: list[str] = []
+    created_at = next(
+        (line[len("# Created: ") :] for line in lines if line.startswith("# Created: ")),
+        None,
+    )
     directory_stack: list[str] = []
     last_connector = chr(96) + "-- "
 
@@ -257,6 +268,7 @@ def _parse_text_snapshot(path: Path, content: str) -> SnapshotData:
         source_format="text",
         entries=entries,
         warnings=warnings,
+        created_at=created_at,
     )
 
 
@@ -410,6 +422,12 @@ def compare_snapshots(
 
 def _safe_output_stem(path: Path) -> str:
     value = path.stem
+    value = re.sub(
+        r"(?:-|_)(?:tree|snapshot)(?:-|_)\d{8}-\d{6}(?:-\d+)?$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
     for suffix in ("-tree", "_tree", "-snapshot", "_snapshot"):
         if value.lower().endswith(suffix):
             value = value[: -len(suffix)]
@@ -418,10 +436,54 @@ def _safe_output_stem(path: Path) -> str:
     return value or "snapshot"
 
 
-def default_compare_output(left: Path, right: Path, output_format: str) -> Path:
+def _current_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _display_timestamp(value: Optional[str]) -> str:
+    if not value:
+        return "未记录"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def _filename_timestamp(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        parsed = datetime.now().astimezone()
+    return parsed.strftime("%Y%m%d-%H%M%S")
+
+
+def _next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 10000):
+        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise ValueError(f"Could not find an available output filename for: {path.name}")
+
+
+def default_compare_output(
+    left: Path,
+    right: Path,
+    output_format: str,
+    created_at: Optional[str] = None,
+) -> Path:
     extension = "html" if output_format == "html" else "txt"
-    filename = f"{_safe_output_stem(left)}-vs-{_safe_output_stem(right)}-diff.{extension}"
-    return Path.cwd() / filename
+    timestamp = _filename_timestamp(created_at or _current_timestamp())
+    left_stem = _safe_output_stem(left)
+    right_stem = _safe_output_stem(right)
+    if left_stem.casefold() == right_stem.casefold():
+        report_stem = f"{left_stem}-diff"
+    else:
+        report_stem = f"{left_stem}-vs-{right_stem}-diff"
+    filename = f"{report_stem}-{timestamp}.{extension}"
+    return _next_available_path(Path.cwd() / filename)
 
 
 def _format_entry_text(entry: Optional[ManifestEntry]) -> str:
@@ -440,10 +502,14 @@ def iter_text_report(
     right: SnapshotData,
     result: ComparisonResult,
     include_unchanged: bool,
+    created_at: str,
 ) -> Iterator[str]:
     yield f"# DirTree Comparison v{COMPARE_FORMAT_VERSION}"
+    yield f"# Created: {created_at}"
     yield f"# Left: {left.source_name}"
+    yield f"# Left created: {left.created_at or 'unknown'}"
     yield f"# Right: {right.source_name}"
+    yield f"# Right created: {right.created_at or 'unknown'}"
     yield (
         "# Summary: "
         f"changed={result.counts['changed']} added={result.counts['added']} "
@@ -528,8 +594,18 @@ h1 { margin: 0; font-size: 28px; font-weight: 680; line-height: 1.2; letter-spac
   border-radius: 6px;
   background: var(--surface-muted);
   overflow-wrap: anywhere;
+}
+.snapshot-name strong {
+  display: block;
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
+}
+.snapshot-created {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 .snapshot-arrow { color: var(--muted); text-align: center; font-weight: 700; }
 .metrics {
@@ -720,6 +796,7 @@ def iter_html_report(
     right: SnapshotData,
     result: ComparisonResult,
     include_unchanged: bool,
+    created_at: str,
 ) -> Iterator[str]:
     initial_filter = "all" if include_unchanged else "differences"
     yield "<!doctype html>"
@@ -737,9 +814,15 @@ def iter_html_report(
     yield '  <p class="product-name">DirTree Snapshot</p>'
     yield "  <h1>清单差异报告</h1>"
     yield '  <div class="snapshot-pair">'
-    yield f'    <div class="snapshot-name">{html.escape(left.source_name)}</div>'
+    yield (
+        f'    <div class="snapshot-name"><strong>{html.escape(left.source_name)}</strong>'
+        f'<time class="snapshot-created">生成时间：{html.escape(_display_timestamp(left.created_at))}</time></div>'
+    )
     yield '    <div class="snapshot-arrow">-&gt;</div>'
-    yield f'    <div class="snapshot-name">{html.escape(right.source_name)}</div>'
+    yield (
+        f'    <div class="snapshot-name"><strong>{html.escape(right.source_name)}</strong>'
+        f'<time class="snapshot-created">生成时间：{html.escape(_display_timestamp(right.created_at))}</time></div>'
+    )
     yield "  </div>"
     yield '  <dl class="metrics" aria-label="差异统计">'
     yield f'    <div class="metric metric-changed"><dt>已更改</dt><dd>{result.counts["changed"]}</dd></div>'
@@ -802,6 +885,7 @@ def iter_html_report(
     yield '<footer class="page-footer">'
     yield f"  <span>Comparison format v{COMPARE_FORMAT_VERSION}</span>"
     yield f"  <span>差异 {result.differences} 项</span>"
+    yield f"  <span>报告时间 {_display_timestamp(created_at)}</span>"
     yield "</footer>"
     yield _COMPARE_SCRIPT
     yield "</body>"
@@ -846,7 +930,11 @@ def build_compare_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("left", help="source or earlier snapshot")
     parser.add_argument("right", help="backup or later snapshot")
-    parser.add_argument("-o", "--output", help="comparison report output file")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="report output file (default name includes the current timestamp)",
+    )
     parser.add_argument(
         "--format",
         choices=("html", "text"),
@@ -879,6 +967,7 @@ def run_compare(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
+    report_created_at = _current_timestamp()
     output: Optional[Path] = None
     if args.output:
         output = Path(os.path.expandvars(os.path.expanduser(args.output.strip('"'))))
@@ -887,7 +976,12 @@ def run_compare(argv: Optional[Sequence[str]] = None) -> int:
     if output_format is None:
         output_format = "text" if output is not None and output.suffix.lower() == ".txt" else "html"
     if output is None:
-        output = default_compare_output(left_path, right_path, output_format)
+        output = default_compare_output(
+            left_path,
+            right_path,
+            output_format,
+            report_created_at,
+        )
 
     absolute_output = Path(os.path.abspath(os.fspath(output)))
     input_keys = {
@@ -899,9 +993,21 @@ def run_compare(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     if output_format == "html":
-        lines = iter_html_report(left, right, result, args.include_unchanged)
+        lines = iter_html_report(
+            left,
+            right,
+            result,
+            args.include_unchanged,
+            report_created_at,
+        )
     else:
-        lines = iter_text_report(left, right, result, args.include_unchanged)
+        lines = iter_text_report(
+            left,
+            right,
+            result,
+            args.include_unchanged,
+            report_created_at,
+        )
 
     try:
         _write_report(absolute_output, lines)
@@ -909,13 +1015,20 @@ def run_compare(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Error: could not write comparison report: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Left snapshot: {left.source_name} ({len(left.entries)} entries)")
-    print(f"Right snapshot: {right.source_name} ({len(right.entries)} entries)")
+    print(
+        f"Left snapshot: {left.source_name} ({len(left.entries)} entries, "
+        f"{_display_timestamp(left.created_at)})"
+    )
+    print(
+        f"Right snapshot: {right.source_name} ({len(right.entries)} entries, "
+        f"{_display_timestamp(right.created_at)})"
+    )
     print(f"Changed: {result.counts['changed']}")
     print(f"Added: {result.counts['added']}")
     print(f"Removed: {result.counts['removed']}")
     print(f"Same: {result.counts['same']}")
     print(f"SHA-256 verified: {result.hash_verified}")
+    print(f"Report time: {_display_timestamp(report_created_at)}")
     print(f"Comparison report: {absolute_output}")
     for warning in result.warnings:
         print(f"Warning: {warning}", file=sys.stderr)

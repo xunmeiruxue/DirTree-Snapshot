@@ -13,11 +13,12 @@ import stat
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence, TextIO
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HASH_CHUNK_SIZE = 1024 * 1024
 PROGRESS_REFRESH_SECONDS = 0.1
 WarningHandler = Callable[[Path, str], None]
@@ -28,6 +29,7 @@ class SnapshotOptions:
     directories_only: bool = False
     include_hash: bool = False
     output_format: str = "html"
+    created_at: Optional[str] = None
 
 
 @dataclass
@@ -389,6 +391,7 @@ def iter_snapshot_lines(
 ) -> Iterator[str]:
     """Yield snapshot lines while updating stats."""
     yield "# DirTree Snapshot v2"
+    yield f"# Created: {options.created_at or _current_timestamp()}"
     mode = "directories-only" if options.directories_only else "files-and-directories"
     details = "none" if options.directories_only else "size-bytes"
     if options.include_hash:
@@ -507,6 +510,14 @@ h1 {
   margin: 8px 0 0;
   color: var(--muted);
   font-size: 13px;
+}
+
+.snapshot-time {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .metrics {
@@ -1158,6 +1169,9 @@ def iter_snapshot_html(
     root_label = root.name or root.drive.rstrip(":\\/") or "root"
     escaped_root = _html_display_name(root_label)
     root_search = _html_search_path((root_label,))
+    created_at = options.created_at or _current_timestamp()
+    created_attribute = html.escape(created_at, quote=True)
+    created_display = html.escape(_display_timestamp(created_at))
     if options.directories_only:
         mode_label = "仅目录"
     elif options.include_hash:
@@ -1183,6 +1197,10 @@ def iter_snapshot_html(
     yield '      <p class="product-name">DirTree Snapshot</p>'
     yield f"      <h1>{escaped_root}</h1>"
     yield f'      <p class="snapshot-mode">{mode_label}</p>'
+    yield (
+        f'      <time class="snapshot-time" datetime="{created_attribute}" '
+        f'data-created-at="{created_attribute}">生成时间：{created_display}</time>'
+    )
     yield "    </div>"
     yield '    <dl class="metrics" aria-label="清单统计">'
     yield '      <div class="metric"><dt>目录</dt><dd data-stat="directories">0</dd></div>'
@@ -1250,7 +1268,7 @@ def iter_snapshot_html(
     )
     yield f'<script id="snapshot-stats" type="application/json">{stats_json}</script>'
     yield '<footer class="page-footer">'
-    yield '  <span>Snapshot format v3</span>'
+    yield '  <span>Snapshot format v4</span>'
     yield f"  <span>{mode_label}</span>"
     yield "</footer>"
     yield _HTML_SCRIPT
@@ -1268,6 +1286,8 @@ def write_snapshot(
     """Write a snapshot atomically and return its scan statistics."""
     root = _absolute_path(root)
     output = _absolute_path(output)
+    if options.created_at is None:
+        options = replace(options, created_at=_current_timestamp())
 
     if not root.is_dir():
         raise ValueError(f"Not a directory: {root}")
@@ -1343,11 +1363,47 @@ def _clean_path_argument(value: str) -> str:
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def default_output_path(root: Path, output_format: str = "html") -> Path:
+def _current_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _display_timestamp(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def _filename_timestamp(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        parsed = datetime.now().astimezone()
+    return parsed.strftime("%Y%m%d-%H%M%S")
+
+
+def _next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 10000):
+        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise ValueError(f"Could not find an available output filename for: {path.name}")
+
+
+def default_output_path(
+    root: Path,
+    output_format: str = "html",
+    created_at: Optional[str] = None,
+) -> Path:
     label = root.name or root.drive.rstrip(":\\/") or "root"
     label = _INVALID_FILENAME_CHARS.sub("_", label).strip(". ") or "root"
     extension = "html" if output_format == "html" else "txt"
-    return Path.cwd() / f"{label}-tree.{extension}"
+    timestamp = _filename_timestamp(created_at or _current_timestamp())
+    path = Path.cwd() / f"{label}-tree-{timestamp}.{extension}"
+    return _next_available_path(path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1366,7 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output",
-        help="output file (default: <folder>-tree.html in the current directory)",
+        help="output file (default: <folder>-tree-YYYYMMDD-HHMMSS.html)",
     )
     parser.add_argument(
         "--format",
@@ -1420,6 +1476,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Error: directory does not exist: {root}", file=sys.stderr)
         return 2
 
+    created_at = _current_timestamp()
     output: Optional[Path] = None
     if args.output:
         cleaned_output = _clean_path_argument(args.output)
@@ -1436,17 +1493,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_format = "html"
 
     if output is None:
-        output = _absolute_path(default_output_path(root, output_format))
+        output = _absolute_path(default_output_path(root, output_format, created_at))
 
     options = SnapshotOptions(
         directories_only=args.dirs_only,
         include_hash=args.hash,
         output_format=output_format,
+        created_at=created_at,
     )
 
     print(f"Scanning: {root}")
     print(f"Output format: {options.output_format}")
     print(f"SHA-256: {'enabled' if options.include_hash else 'disabled'}")
+    print(f"Snapshot time: {_display_timestamp(created_at)}")
     print(f"Output file: {output}")
 
     hash_progress: Optional[_HashProgress] = None
