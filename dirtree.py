@@ -18,7 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence, TextIO
 
-VERSION = "0.5.0"
+from dirtree_compare import run_compare
+
+VERSION = "0.6.0"
 HASH_CHUNK_SIZE = 1024 * 1024
 PROGRESS_REFRESH_SECONDS = 0.1
 WarningHandler = Callable[[Path, str], None]
@@ -1444,13 +1446,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0].casefold() == "compare":
-        from dirtree_compare import run_compare
-
-        return run_compare(arguments[1:])
-
+def _run_snapshot(arguments: Sequence[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(arguments)
 
@@ -1459,12 +1455,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     directory_value = args.directory
     if directory_value is None:
-        print("DirTree Snapshot")
-        try:
-            directory_value = input("Directory to scan: ")
-        except (EOFError, KeyboardInterrupt):
-            print("\nError: no directory was provided.", file=sys.stderr)
-            return 2
+        print("Error: no directory was provided.", file=sys.stderr)
+        return 2
 
     cleaned_directory = _clean_path_argument(directory_value)
     if not cleaned_directory:
@@ -1555,6 +1547,81 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 1
     return 0
+
+
+def _prompt_value(prompt: str) -> Optional[str]:
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.", file=sys.stderr)
+        return None
+
+
+def _is_yes(value: str) -> bool:
+    return value.casefold() in {"y", "yes", "1", "true"}
+
+
+def _run_interactive() -> int:
+    print("DirTree Snapshot")
+    print()
+    print("[1] Generate snapshot")
+    print("[2] Compare two snapshots")
+    action = _prompt_value("Choose action (1/2, default 1): ")
+    if action is None:
+        return 2
+
+    if action.casefold() in {"2", "c", "compare"}:
+        left_value = _prompt_value("Left snapshot file: ")
+        if left_value is None:
+            return 2
+        right_value = _prompt_value("Right snapshot file: ")
+        if right_value is None:
+            return 2
+        if not left_value or not right_value:
+            print("Error: both snapshot files are required.", file=sys.stderr)
+            return 2
+
+        output_value = _prompt_value("Output file (Enter for automatic name): ")
+        if output_value is None:
+            return 2
+        include_value = _prompt_value("Include unchanged items? (y/N): ")
+        if include_value is None:
+            return 2
+
+        compare_arguments = [
+            _clean_path_argument(left_value),
+            _clean_path_argument(right_value),
+        ]
+        if output_value:
+            compare_arguments.extend(["-o", _clean_path_argument(output_value)])
+        if _is_yes(include_value):
+            compare_arguments.append("--include-unchanged")
+
+        return run_compare(compare_arguments)
+
+    directory_value = _prompt_value("Directory to scan: ")
+    if directory_value is None:
+        return 2
+    if not directory_value:
+        print("Error: no directory was provided.", file=sys.stderr)
+        return 2
+    hash_value = _prompt_value("Calculate SHA-256 hashes? (y/N): ")
+    if hash_value is None:
+        return 2
+
+    snapshot_arguments = [_clean_path_argument(directory_value)]
+    if _is_yes(hash_value):
+        snapshot_arguments.append("--hash")
+    return _run_snapshot(snapshot_arguments)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        return _run_interactive()
+    if arguments[0].casefold() == "compare":
+        return run_compare(arguments[1:])
+    return _run_snapshot(arguments)
 
 
 if __name__ == "__main__":
