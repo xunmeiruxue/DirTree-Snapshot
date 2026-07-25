@@ -20,7 +20,7 @@ from typing import Callable, Iterator, Optional, Sequence, TextIO
 
 from dirtree_compare import run_compare
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 HASH_CHUNK_SIZE = 1024 * 1024
 PROGRESS_REFRESH_SECONDS = 0.1
 WarningHandler = Callable[[Path, str], None]
@@ -381,6 +381,110 @@ def _iter_directory(
             yield f"{prefix}{connector}{name} [special-file]"
         else:
             yield f"{prefix}{connector}{name} [unreadable]"
+
+
+def _collect_json_entries(
+    directory: Path,
+    path_parts: tuple[str, ...],
+    options: SnapshotOptions,
+    stats: SnapshotStats,
+    excluded_paths: set[str],
+    on_warning: Optional[WarningHandler],
+    hash_progress: Optional[_HashProgress],
+) -> list[dict[str, object]]:
+    entries = _read_entries(directory, options, stats, excluded_paths, on_warning)
+    if entries is None:
+        return [{"path": "/".join(path_parts + ("[unreadable]",)), "kind": "unreadable"}]
+
+    result: list[dict[str, object]] = []
+    for entry in entries:
+        current_parts = path_parts + (entry.name,)
+        relative_path = "/".join(current_parts)
+        if entry.kind == "directory":
+            stats.directories += 1
+            result.append({"path": relative_path, "kind": "directory"})
+            result.extend(
+                _collect_json_entries(
+                    entry.path,
+                    current_parts,
+                    options,
+                    stats,
+                    excluded_paths,
+                    on_warning,
+                    hash_progress,
+                )
+            )
+        elif entry.kind == "file":
+            stats.files += 1
+            details = _collect_file_details(
+                entry,
+                options,
+                stats,
+                on_warning,
+                hash_progress,
+            )
+            item: dict[str, object] = {
+                "path": relative_path,
+                "kind": "file",
+                "size": details.size,
+            }
+            if options.include_hash:
+                item["sha256"] = details.sha256 or "unreadable"
+            result.append(item)
+        elif entry.kind == "link":
+            stats.links += 1
+            result.append({"path": relative_path, "kind": "link"})
+        elif entry.kind == "other":
+            result.append({"path": relative_path, "kind": "special"})
+        else:
+            result.append({"path": relative_path, "kind": "unreadable"})
+    return result
+
+
+def iter_snapshot_json(
+    root: Path,
+    options: SnapshotOptions,
+    stats: SnapshotStats,
+    excluded_paths: set[str],
+    on_warning: Optional[WarningHandler] = None,
+    hash_progress: Optional[_HashProgress] = None,
+) -> Iterator[str]:
+    """Yield a canonical machine-readable JSON snapshot."""
+    entries = _collect_json_entries(
+        root,
+        (),
+        options,
+        stats,
+        excluded_paths,
+        on_warning,
+        hash_progress,
+    )
+    mode = "directories-only" if options.directories_only else "files-and-directories"
+    details = "none" if options.directories_only else "size-bytes"
+    if options.include_hash:
+        details += ",sha256"
+    root_name = root.name or root.drive.rstrip(":\\/") or "root"
+    payload = {
+        "schema": "dirtree.snapshot",
+        "schema_version": 1,
+        "tool_version": VERSION,
+        "created_at": options.created_at or _current_timestamp(),
+        "root_name": root_name,
+        "mode": mode,
+        "details": details,
+        "hash": {
+            "algorithm": "SHA-256",
+            "enabled": options.include_hash,
+        },
+        "statistics": {
+            "directories": stats.directories,
+            "files": stats.files,
+            "links": stats.links,
+            "errors": stats.errors,
+        },
+        "entries": entries,
+    }
+    yield json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def iter_snapshot_lines(
@@ -1295,7 +1399,7 @@ def write_snapshot(
         raise ValueError(f"Not a directory: {root}")
     if not output.parent.is_dir():
         raise ValueError(f"Output directory does not exist: {output.parent}")
-    if options.output_format not in {"html", "text"}:
+    if options.output_format not in {"html", "text", "json"}:
         raise ValueError(f"Unsupported output format: {options.output_format}")
 
     stats = SnapshotStats()
@@ -1315,12 +1419,21 @@ def write_snapshot(
         with os.fdopen(
             file_descriptor,
             "w",
-            encoding="utf-8-sig",
+            encoding="utf-8" if options.output_format == "json" else "utf-8-sig",
             newline="\n",
         ) as output_file:
             file_descriptor = -1
             if options.output_format == "html":
                 snapshot_lines = iter_snapshot_html(
+                    root,
+                    options,
+                    stats,
+                    excluded_paths,
+                    on_warning,
+                    hash_progress,
+                )
+            elif options.output_format == "json":
+                snapshot_lines = iter_snapshot_json(
                     root,
                     options,
                     stats,
@@ -1402,7 +1515,7 @@ def default_output_path(
 ) -> Path:
     label = root.name or root.drive.rstrip(":\\/") or "root"
     label = _INVALID_FILENAME_CHARS.sub("_", label).strip(". ") or "root"
-    extension = "html" if output_format == "html" else "txt"
+    extension = {"html": "html", "text": "txt", "json": "json"}.get(output_format, output_format)
     timestamp = _filename_timestamp(created_at or _current_timestamp())
     path = Path.cwd() / f"{label}-tree-{timestamp}.{extension}"
     return _next_available_path(path)
@@ -1428,8 +1541,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=("html", "text"),
-        help="output format; inferred from .txt, otherwise defaults to html",
+        choices=("html", "text", "json"),
+        help="output format; inferred from .txt/.json, otherwise defaults to html",
     )
     parser.add_argument(
         "-d",
@@ -1481,6 +1594,8 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     if output_format is None:
         if output is not None and output.suffix.lower() == ".txt":
             output_format = "text"
+        elif output is not None and output.suffix.lower() == ".json":
+            output_format = "json"
         else:
             output_format = "html"
 
@@ -1608,10 +1723,19 @@ def _run_interactive() -> int:
     hash_value = _prompt_value("Calculate SHA-256 hashes? (y/N): ")
     if hash_value is None:
         return 2
+    format_value = _prompt_value("Output format (html/text/json, default html): ")
+    if format_value is None:
+        return 2
+    format_value = format_value.casefold() or "html"
+    if format_value not in {"html", "text", "json"}:
+        print("Error: output format must be html, text, or json.", file=sys.stderr)
+        return 2
 
     snapshot_arguments = [_clean_path_argument(directory_value)]
     if _is_yes(hash_value):
         snapshot_arguments.append("--hash")
+    if format_value != "html":
+        snapshot_arguments.extend(["--format", format_value])
     return _run_snapshot(snapshot_arguments)
 
 

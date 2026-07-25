@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
 import re
 import sys
@@ -272,6 +273,48 @@ def _parse_text_snapshot(path: Path, content: str) -> SnapshotData:
     )
 
 
+def _parse_json_snapshot(path: Path, content: str) -> SnapshotData:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON snapshot {path.name}: {exc}") from exc
+
+    if payload.get("schema") != "dirtree.snapshot":
+        raise ValueError(f"Unsupported JSON snapshot schema: {path.name}")
+    if payload.get("schema_version") != 1:
+        raise ValueError(f"Unsupported JSON snapshot version: {path.name}")
+
+    entries: list[ManifestEntry] = []
+    warnings: list[str] = []
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+        raise ValueError(f"JSON snapshot entries must be an array: {path.name}")
+
+    valid_kinds = {"directory", "file", "link", "special", "unreadable"}
+    for index, raw_entry in enumerate(raw_entries, start=1):
+        if not isinstance(raw_entry, dict):
+            warnings.append(f"{path.name} 第 {index} 个条目不是对象，已跳过")
+            continue
+        entry_path = _normalize_path(str(raw_entry.get("path", "")))
+        kind = str(raw_entry.get("kind", ""))
+        if not entry_path or kind not in valid_kinds:
+            warnings.append(f"{path.name} 第 {index} 个条目缺少有效路径或类型，已跳过")
+            continue
+        raw_size = raw_entry.get("size")
+        size = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) else None
+        raw_hash = raw_entry.get("sha256")
+        sha256 = str(raw_hash) if raw_hash is not None else None
+        entries.append(ManifestEntry(path=entry_path, kind=kind, size=size, sha256=sha256))
+
+    return SnapshotData(
+        source_name=path.name,
+        source_format="json",
+        entries=entries,
+        warnings=warnings,
+        created_at=payload.get("created_at") if isinstance(payload.get("created_at"), str) else None,
+    )
+
+
 def load_snapshot(path: Path) -> SnapshotData:
     path = Path(os.path.abspath(os.fspath(path)))
     if not path.is_file():
@@ -282,6 +325,8 @@ def load_snapshot(path: Path) -> SnapshotData:
         raise ValueError(f"Could not read snapshot {path.name}: {exc}") from exc
 
     stripped = content.lstrip()
+    if stripped.startswith("{"):
+        return _parse_json_snapshot(path, content)
     if stripped.lower().startswith("<!doctype html") or stripped.lower().startswith("<html"):
         return _parse_html_snapshot(path, content)
     return _parse_text_snapshot(path, content)
