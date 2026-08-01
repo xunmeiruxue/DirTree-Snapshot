@@ -16,6 +16,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
+from dirtree_assets import load_text, render
+
 COMPARE_FORMAT_VERSION = 1
 _HASH_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _FILE_DETAILS_PATTERN = re.compile(
@@ -579,240 +581,6 @@ def iter_text_report(
             yield f"- {warning}"
 
 
-_COMPARE_STYLE = """
-:root {
-  color-scheme: light;
-  --page: #f3f5f6;
-  --surface: #ffffff;
-  --surface-muted: #f8fafb;
-  --text: #172229;
-  --muted: #65747c;
-  --line: #d7e0e4;
-  --line-strong: #b9c6cc;
-  --accent: #1769aa;
-  --accent-soft: #e7f1f8;
-  --added: #287a50;
-  --added-soft: #edf8f1;
-  --removed: #b33c3c;
-  --removed-soft: #fdf0f0;
-  --changed: #a96608;
-  --changed-soft: #fff7e8;
-  --same: #60717a;
-  --same-soft: #f0f3f4;
-  --warning: #85560a;
-  --warning-soft: #fff5dc;
-  --shadow: 0 12px 30px rgba(23, 34, 41, 0.08);
-}
-
-* { box-sizing: border-box; }
-html { background: var(--page); }
-body {
-  margin: 0;
-  min-width: 320px;
-  background: var(--page);
-  color: var(--text);
-  font-family: Inter, "Segoe UI", "Microsoft YaHei UI", Arial, sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-  letter-spacing: 0;
-}
-button, input, select { font: inherit; letter-spacing: 0; }
-.header-inner, .page-main, .page-footer {
-  width: min(1240px, calc(100% - 40px));
-  margin: 0 auto;
-}
-.page-header { border-bottom: 1px solid var(--line); background: var(--surface); }
-.header-inner { padding: 24px 0 20px; }
-.product-name { margin: 0 0 5px; color: var(--accent); font-size: 13px; font-weight: 700; }
-h1 { margin: 0; font-size: 28px; font-weight: 680; line-height: 1.2; letter-spacing: 0; }
-.snapshot-pair {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-  margin-top: 18px;
-}
-.snapshot-name {
-  min-width: 0;
-  padding: 9px 12px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface-muted);
-  overflow-wrap: anywhere;
-}
-.snapshot-name strong {
-  display: block;
-  font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 12px;
-}
-.snapshot-created {
-  display: block;
-  margin-top: 3px;
-  color: var(--muted);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-.snapshot-arrow { color: var(--muted); text-align: center; font-weight: 700; }
-.metrics {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  margin: 22px 0 0;
-  border-top: 1px solid var(--line);
-}
-.metric { padding: 13px 16px 0; border-left: 1px solid var(--line); }
-.metric:first-child { border-left: 0; }
-.metric dt { color: var(--muted); font-size: 12px; }
-.metric dd { margin: 2px 0 0; font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.metric-added dd { color: var(--added); }
-.metric-removed dd { color: var(--removed); }
-.metric-changed dd { color: var(--changed); }
-.page-main { padding: 26px 0 36px; }
-.notice {
-  margin-bottom: 14px;
-  padding: 10px 13px;
-  border: 1px solid #e4c986;
-  border-radius: 6px;
-  background: var(--warning-soft);
-  color: var(--warning);
-}
-.report-panel {
-  overflow: hidden;
-  border: 1px solid var(--line-strong);
-  border-radius: 8px;
-  background: var(--surface);
-  box-shadow: var(--shadow);
-}
-.toolbar {
-  display: grid;
-  grid-template-columns: minmax(220px, 1fr) 190px auto;
-  gap: 10px;
-  align-items: center;
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--line);
-  background: var(--surface-muted);
-}
-.toolbar input, .toolbar select {
-  width: 100%;
-  height: 38px;
-  padding: 0 11px;
-  border: 1px solid var(--line-strong);
-  border-radius: 6px;
-  outline: none;
-  background: var(--surface);
-  color: var(--text);
-}
-.toolbar input:focus, .toolbar select:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-.match-count { min-width: 72px; color: var(--muted); text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
-.table-scroll { overflow: auto; }
-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-th {
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--line-strong);
-  background: #f5f8f9;
-  color: var(--muted);
-  text-align: left;
-  font-size: 12px;
-  font-weight: 700;
-}
-td { padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
-tbody tr:hover { background: var(--surface-muted); }
-th:nth-child(1) { width: 84px; }
-th:nth-child(2) { width: 34%; }
-th:nth-child(3) { width: 90px; }
-th:nth-child(4), th:nth-child(5) { width: 23%; }
-.status-badge {
-  display: inline-block;
-  min-width: 52px;
-  padding: 2px 6px;
-  border: 1px solid currentColor;
-  border-radius: 4px;
-  text-align: center;
-  font-size: 11px;
-  font-weight: 700;
-}
-.status-added { color: var(--added); background: var(--added-soft); }
-.status-removed { color: var(--removed); background: var(--removed-soft); }
-.status-changed { color: var(--changed); background: var(--changed-soft); }
-.status-same { color: var(--same); background: var(--same-soft); }
-.path-value { display: block; overflow-wrap: anywhere; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
-.reason { margin-top: 5px; color: var(--muted); font-size: 12px; }
-.kind-value { color: var(--muted); }
-.metadata { display: grid; gap: 5px; }
-.size-value { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; font-variant-numeric: tabular-nums; }
-.hash-details summary { color: var(--accent); cursor: pointer; font-size: 11px; }
-.hash-value { display: block; margin-top: 4px; overflow-wrap: anywhere; color: #285944; font-family: "Cascadia Mono", Consolas, monospace; font-size: 10px; }
-.no-value { color: #9aa6ac; }
-[hidden] { display: none !important; }
-.page-footer { display: flex; justify-content: space-between; gap: 20px; padding: 0 0 25px; color: var(--muted); font-size: 12px; }
-
-@media (max-width: 760px) {
-  .header-inner, .page-main, .page-footer { width: min(100% - 24px, 1240px); }
-  h1 { font-size: 24px; }
-  .snapshot-pair { grid-template-columns: 1fr; }
-  .snapshot-arrow { transform: rotate(90deg); }
-  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .metric { border-left: 0; border-bottom: 1px solid var(--line); }
-  .toolbar { grid-template-columns: 1fr; }
-  .match-count { text-align: left; }
-  .table-scroll { overflow: visible; }
-  table, tbody, tr, td { display: block; width: 100%; }
-  thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
-  tbody tr { padding: 10px 12px; border-bottom: 1px solid var(--line-strong); }
-  td { display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 8px; padding: 5px 0; border: 0; }
-  td::before { content: attr(data-label); color: var(--muted); font-size: 11px; font-weight: 700; }
-}
-
-@media print {
-  :root { --page: #ffffff; --shadow: none; }
-  .toolbar { display: none; }
-  .report-panel { box-shadow: none; }
-  tr[hidden] { display: table-row !important; }
-}
-"""
-
-
-_COMPARE_SCRIPT = """
-<script>
-(function () {
-  "use strict";
-  var search = document.getElementById("diff-search");
-  var filter = document.getElementById("status-filter");
-  var count = document.getElementById("match-count");
-  var rows = Array.prototype.slice.call(document.querySelectorAll("tbody tr"));
-
-  function applyFilters() {
-    var query = search.value.trim().toLocaleLowerCase();
-    var status = filter.value;
-    var visible = 0;
-    rows.forEach(function (row) {
-      var rowStatus = row.getAttribute("data-status");
-      var statusMatch = status === "all" || (status === "differences" ? rowStatus !== "same" : rowStatus === status);
-      var searchMatch = !query || (row.getAttribute("data-search") || "").toLocaleLowerCase().indexOf(query) !== -1;
-      row.hidden = !(statusMatch && searchMatch);
-      if (!row.hidden) visible += 1;
-    });
-    count.textContent = visible + " 项";
-  }
-
-  search.addEventListener("input", applyFilters);
-  search.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") {
-      search.value = "";
-      applyFilters();
-      search.blur();
-    }
-  });
-  filter.addEventListener("change", applyFilters);
-  filter.value = document.body.getAttribute("data-initial-filter") || "differences";
-  applyFilters();
-}());
-</script>
-"""
-
-
 def _format_size(value: Optional[int]) -> str:
     return f"{value:,} B" if value is not None else "未记录"
 
@@ -844,65 +612,33 @@ def iter_html_report(
     created_at: str,
 ) -> Iterator[str]:
     initial_filter = "all" if include_unchanged else "differences"
-    yield "<!doctype html>"
-    yield '<html lang="zh-CN">'
-    yield "<head>"
-    yield '  <meta charset="utf-8">'
-    yield '  <meta name="viewport" content="width=device-width, initial-scale=1">'
-    yield "  <title>清单差异报告 - DirTree Snapshot</title>"
-    yield "  <style>"
-    yield _COMPARE_STYLE
-    yield "  </style>"
-    yield "</head>"
-    yield f'<body data-initial-filter="{initial_filter}">'
-    yield '<header class="page-header"><div class="header-inner">'
-    yield '  <p class="product-name">DirTree Snapshot</p>'
-    yield "  <h1>清单差异报告</h1>"
-    yield '  <div class="snapshot-pair">'
-    yield (
-        f'    <div class="snapshot-name"><strong>{html.escape(left.source_name)}</strong>'
-        f'<time class="snapshot-created">生成时间：{html.escape(_display_timestamp(left.created_at))}</time></div>'
-    )
-    yield '    <div class="snapshot-arrow">-&gt;</div>'
-    yield (
-        f'    <div class="snapshot-name"><strong>{html.escape(right.source_name)}</strong>'
-        f'<time class="snapshot-created">生成时间：{html.escape(_display_timestamp(right.created_at))}</time></div>'
-    )
-    yield "  </div>"
-    yield '  <dl class="metrics" aria-label="差异统计">'
-    yield f'    <div class="metric metric-changed"><dt>已更改</dt><dd>{result.counts["changed"]}</dd></div>'
-    yield f'    <div class="metric metric-added"><dt>新增</dt><dd>{result.counts["added"]}</dd></div>'
-    yield f'    <div class="metric metric-removed"><dt>缺失</dt><dd>{result.counts["removed"]}</dd></div>'
-    yield f'    <div class="metric"><dt>相同</dt><dd>{result.counts["same"]}</dd></div>'
-    yield f'    <div class="metric"><dt>哈希已核验</dt><dd>{result.hash_verified}</dd></div>'
-    yield "  </dl>"
-    yield "</div></header>"
-    yield '<main class="page-main">'
+    notices: list[str] = []
     if result.unverified_files:
-        yield (
+        notices.append(
             '<div class="notice">'
             f"有 {result.unverified_files} 个同路径文件未同时包含可用 SHA-256；"
             "这些文件仅根据路径、类型和大小判断。"
             "</div>"
         )
-    for warning in result.warnings:
-        yield f'<div class="notice">{html.escape(warning)}</div>'
-    yield '<section class="report-panel" aria-label="差异列表">'
-    yield '  <div class="toolbar">'
-    yield '    <input id="diff-search" type="search" autocomplete="off" placeholder="搜索相对路径">'
-    yield '    <select id="status-filter" aria-label="状态筛选">'
-    yield '      <option value="differences">仅差异</option>'
-    yield '      <option value="all">全部项目</option>'
-    yield '      <option value="changed">已更改</option>'
-    yield '      <option value="added">新增</option>'
-    yield '      <option value="removed">缺失</option>'
-    yield '      <option value="same">相同</option>'
-    yield "    </select>"
-    yield '    <output id="match-count" class="match-count" aria-live="polite"></output>'
-    yield "  </div>"
-    yield '  <div class="table-scroll"><table>'
-    yield "    <thead><tr><th>状态</th><th>相对路径</th><th>类型</th><th>左侧</th><th>右侧</th></tr></thead>"
-    yield "    <tbody>"
+    notices.extend(
+        f'<div class="notice">{html.escape(warning)}</div>'
+        for warning in result.warnings
+    )
+    yield render(
+        "compare_head.html",
+        STYLES=load_text("compare.css"),
+        INITIAL_FILTER=initial_filter,
+        LEFT_NAME=html.escape(left.source_name),
+        LEFT_CREATED=html.escape(_display_timestamp(left.created_at)),
+        RIGHT_NAME=html.escape(right.source_name),
+        RIGHT_CREATED=html.escape(_display_timestamp(right.created_at)),
+        CHANGED=str(result.counts["changed"]),
+        ADDED=str(result.counts["added"]),
+        REMOVED=str(result.counts["removed"]),
+        SAME=str(result.counts["same"]),
+        HASH_VERIFIED=str(result.hash_verified),
+        NOTICES="\n".join(notices),
+    )
 
     for row in result.rows:
         search_value = html.escape(row.path, quote=True)
@@ -923,19 +659,12 @@ def iter_html_report(
         yield f'        <td data-label="右侧">{_entry_html(row.right)}</td>'
         yield "      </tr>"
 
-    yield "    </tbody>"
-    yield "  </table></div>"
-    yield "</section>"
-    yield "</main>"
-    yield '<footer class="page-footer">'
-    yield f"  <span>Comparison format v{COMPARE_FORMAT_VERSION}</span>"
-    yield f"  <span>差异 {result.differences} 项</span>"
-    yield f"  <span>报告时间 {_display_timestamp(created_at)}</span>"
-    yield "</footer>"
-    yield _COMPARE_SCRIPT
-    yield "</body>"
-    yield "</html>"
-
+    yield render(
+        "compare_footer.html",
+        DIFFERENCES=str(result.differences),
+        REPORT_TIME=_display_timestamp(created_at),
+        SCRIPT=load_text("compare.js"),
+    )
 
 def _write_report(path: Path, lines: Iterator[str]) -> None:
     path = Path(os.path.abspath(os.fspath(path)))

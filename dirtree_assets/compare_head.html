@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>清单差异报告 - DirTree Snapshot</title>
+  <style>
+{{STYLES}}
+  </style>
+</head>
+<body data-initial-filter="{{INITIAL_FILTER}}">
+<header class="page-header"><div class="header-inner">
+  <p class="product-name">DirTree Snapshot</p>
+  <h1>清单差异报告</h1>
+  <div class="snapshot-pair">
+    <div class="snapshot-name"><strong>{{LEFT_NAME}}</strong><time class="snapshot-created">生成时间：{{LEFT_CREATED}}</time></div>
+    <div class="snapshot-arrow">-&gt;</div>
+    <div class="snapshot-name"><strong>{{RIGHT_NAME}}</strong><time class="snapshot-created">生成时间：{{RIGHT_CREATED}}</time></div>
+  </div>
+  <dl class="metrics" aria-label="差异统计">
+    <div class="metric metric-changed"><dt>已更改</dt><dd>{{CHANGED}}</dd></div>
+    <div class="metric metric-added"><dt>新增</dt><dd>{{ADDED}}</dd></div>
+    <div class="metric metric-removed"><dt>缺失</dt><dd>{{REMOVED}}</dd></div>
+    <div class="metric"><dt>相同</dt><dd>{{SAME}}</dd></div>
+    <div class="metric"><dt>哈希已核验</dt><dd>{{HASH_VERIFIED}}</dd></div>
+  </dl>
+</div></header>
+<main class="page-main">
+{{NOTICES}}
+<section class="report-panel" aria-label="差异列表">
+  <div class="toolbar">
+    <input id="diff-search" type="search" autocomplete="off" placeholder="搜索相对路径">
+    <select id="status-filter" aria-label="状态筛选">
+      <option value="differences">仅差异</option>
+      <option value="all">全部项目</option>
+      <option value="changed">已更改</option>
+      <option value="added">新增</option>
+      <option value="removed">缺失</option>
+      <option value="same">相同</option>
+    </select>
+    <output id="match-count" class="match-count" aria-live="polite"></output>
+  </div>
+  <div class="table-scroll"><table>
+    <thead><tr><th>状态</th><th>相对路径</th><th>类型</th><th>左侧</th><th>右侧</th></tr></thead>
+    <tbody>

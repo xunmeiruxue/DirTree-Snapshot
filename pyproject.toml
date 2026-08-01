@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dirtree-snapshot"
-version = "0.7.0"
+version = "0.8.0"
 description = "Generate and compare readable directory snapshots"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -23,3 +23,7 @@ dirtree = "dirtree:main"
 
 [tool.setuptools]
 py-modules = ["dirtree", "dirtree_compare"]
+packages = ["dirtree_assets"]
+
+[tool.setuptools.package-data]
+dirtree_assets = ["*.css", "*.js", "*.svg", "*.html"]

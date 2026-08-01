@@ -12,6 +12,7 @@ if errorlevel 1 goto working_directory_error
 :check_files
 if not exist "%~dp0dirtree.py" goto missing_script
 if not exist "%~dp0dirtree_compare.py" goto missing_compare_script
+if not exist "%~dp0dirtree_assets\__init__.py" goto missing_assets
 
 for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do if not defined python_executable set "python_executable=%%P"
 if not defined python_executable goto detect_python_command
@@ -52,6 +53,14 @@ goto finish
 echo.
 echo [ERROR] Required comparison module was not found:
 echo %~dp0dirtree_compare.py
+set "exit_code=2"
+goto finish
+
+:missing_assets
+echo.
+echo [ERROR] Required template assets were not found:
+echo %~dp0dirtree_assets
+echo Keep the complete dirtree_assets folder beside dirtree.py.
 set "exit_code=2"
 goto finish
 

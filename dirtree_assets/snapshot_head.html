@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{TITLE}}</title>
+  <style>
+{{STYLES}}
+  </style>
+</head>
+<body>
+{{ICONS}}
+<header class="page-header">
+  <div class="header-inner">
+    <div class="title-group">
+      <p class="product-name">DirTree Snapshot</p>
+      <h1>{{ROOT_NAME}}</h1>
+      <p class="snapshot-mode">{{MODE}}</p>
+      <time class="snapshot-time" datetime="{{CREATED_AT_ATTR}}" data-created-at="{{CREATED_AT_ATTR}}">生成时间：{{CREATED_AT_DISPLAY}}</time>
+    </div>
+    <dl class="metrics" aria-label="清单统计">
+      <div class="metric"><dt>目录</dt><dd data-stat="directories">0</dd></div>
+      <div class="metric"><dt>文件</dt><dd data-stat="files">0</dd></div>
+      <div class="metric"><dt>链接</dt><dd data-stat="links">0</dd></div>
+      <div class="metric metric-errors"><dt>错误</dt><dd data-stat="errors">0</dd></div>
+    </dl>
+  </div>
+</header>
+<main class="page-main">
+  <section class="tree-panel" aria-label="目录结构">
+    <div class="toolbar">
+      <label class="search-field">
+        <span class="sr-only">搜索文件或目录</span>
+        <svg class="search-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg>
+        <input id="tree-search" type="search" autocomplete="off" placeholder="搜索文件或目录">
+      </label>
+      <div class="toolbar-actions">
+        <button id="expand-all" type="button">全部展开</button>
+        <button id="collapse-all" type="button">全部折叠</button>
+        <output id="match-count" class="match-count" aria-live="polite"></output>
+      </div>
+    </div>
+    <div class="tree-scroll">
+      <ul class="tree tree-root">
+        <li class="tree-item directory-item root-item" data-kind="root" data-search="{{ROOT_SEARCH}}">
+          <details open>
+            <summary class="node-row">
+              <svg class="chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-chevron-right"></use></svg>
+              <svg class="node-icon folder-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-folder"></use></svg>
+              <span class="node-name root-name">{{ROOT_NAME}}<span class="node-badge">根目录</span></span><span></span>
+            </summary>
+            <ul class="tree-children">
