@@ -13,15 +13,16 @@ import stat
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence, TextIO
 
 from dirtree_assets import load_text, render
+from dirtree_cache import HashCache, HashCacheError, run_cache
 from dirtree_compare import run_compare
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 HASH_CHUNK_SIZE = 1024 * 1024
 PROGRESS_REFRESH_SECONDS = 0.1
 WarningHandler = Callable[[Path, str], None]
@@ -33,6 +34,7 @@ class SnapshotOptions:
     include_hash: bool = False
     output_format: str = "html"
     created_at: Optional[str] = None
+    hash_cache: Optional[HashCache] = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -70,6 +72,7 @@ class _HashProgress:
         self.enabled = enabled
         self.processed_files = 0
         self.processed_bytes = 0
+        self.cached_files = 0
         self._finished = False
         self._started = False
         self._last_render = 0.0
@@ -93,6 +96,13 @@ class _HashProgress:
         if expected_size is not None and expected_size > bytes_read:
             self.processed_bytes += expected_size - bytes_read
         self.processed_files += 1
+        self._render()
+
+    def finish_cached(self, expected_size: Optional[int]) -> None:
+        if expected_size is not None:
+            self.processed_bytes += expected_size
+        self.processed_files += 1
+        self.cached_files += 1
         self._render()
 
     def message(self, text: str) -> None:
@@ -149,7 +159,8 @@ class _HashProgress:
         line = (
             f"Hashing [{bar}] {ratio * 100:6.2f}% "
             f"{self.processed_files}/{self.totals.files} files "
-            f"{shown_bytes}/{self.totals.bytes} B"
+            f"{shown_bytes}/{self.totals.bytes} B "
+            f"cached={self.cached_files}"
         )
         padded_line = line.ljust(self._line_width)
         self._line_width = max(self._line_width, len(line))
@@ -304,22 +315,31 @@ def _collect_file_details(
     sha256_value: Optional[str] = None
 
     if options.include_hash:
-        bytes_read = 0
-
-        def track_chunk(byte_count: int) -> None:
-            nonlocal bytes_read
-            bytes_read += byte_count
+        cache_probe = None
+        if options.hash_cache is not None:
+            sha256_value, cache_probe = options.hash_cache.lookup(entry.path)
+        if sha256_value is not None:
             if hash_progress is not None:
-                hash_progress.advance_bytes(byte_count)
+                hash_progress.finish_cached(entry.size)
+        else:
+            bytes_read = 0
 
-        try:
-            sha256_value = _sha256(entry.path, track_chunk)
-        except OSError as exc:
-            sha256_value = "unreadable"
-            _report_error(stats, on_warning, entry.path, str(exc))
-        finally:
-            if hash_progress is not None:
-                hash_progress.finish_file(entry.size, bytes_read)
+            def track_chunk(byte_count: int) -> None:
+                nonlocal bytes_read
+                bytes_read += byte_count
+                if hash_progress is not None:
+                    hash_progress.advance_bytes(byte_count)
+
+            try:
+                sha256_value = _sha256(entry.path, track_chunk)
+                if options.hash_cache is not None:
+                    options.hash_cache.store(cache_probe, sha256_value)
+            except OSError as exc:
+                sha256_value = "unreadable"
+                _report_error(stats, on_warning, entry.path, str(exc))
+            finally:
+                if hash_progress is not None:
+                    hash_progress.finish_file(entry.size, bytes_read)
 
     return _FileDetails(size=entry.size, sha256=sha256_value)
 
@@ -731,6 +751,12 @@ def write_snapshot(
 
     stats = SnapshotStats()
     excluded_paths = {_path_key(output)}
+    if options.hash_cache is not None:
+        cache_path = options.hash_cache.path
+        excluded_paths.update(
+            _path_key(Path(os.fspath(cache_path) + suffix))
+            for suffix in ("", "-wal", "-shm", "-journal")
+        )
     file_descriptor = -1
     temporary_path: Optional[Path] = None
 
@@ -854,7 +880,10 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Create a deterministic directory tree snapshot for a single folder."
         ),
-        epilog="Compare snapshots: dirtree compare LEFT RIGHT",
+        epilog=(
+            "Compare snapshots: dirtree compare LEFT RIGHT; "
+            "Manage cache: dirtree cache info|clear|prune"
+        ),
     )
     parser.add_argument(
         "directory",
@@ -882,6 +911,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="include SHA-256 hashes and show hashing progress",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="calculate hashes without reading or updating the local cache",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
 
@@ -892,6 +926,8 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
 
     if args.dirs_only and args.hash:
         parser.error("--hash cannot be combined with --dirs-only")
+    if args.no_cache and not args.hash:
+        parser.error("--no-cache requires --hash")
 
     directory_value = args.directory
     if directory_value is None:
@@ -929,23 +965,41 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     if output is None:
         output = _absolute_path(default_output_path(root, output_format, created_at))
 
+    hash_cache: Optional[HashCache] = None
+    if args.hash and not args.no_cache:
+        try:
+            hash_cache = HashCache()
+        except HashCacheError as exc:
+            print(f"Warning: {exc}; continuing without cache.", file=sys.stderr)
+
     options = SnapshotOptions(
         directories_only=args.dirs_only,
         include_hash=args.hash,
         output_format=output_format,
         created_at=created_at,
+        hash_cache=hash_cache,
     )
 
     print(f"Scanning: {root}")
     print(f"Output format: {options.output_format}")
     print(f"SHA-256: {'enabled' if options.include_hash else 'disabled'}")
+    if options.include_hash:
+        cache_label = str(hash_cache.path) if hash_cache is not None else "disabled"
+        print(f"Hash cache: {cache_label}")
     print(f"Snapshot time: {_display_timestamp(created_at)}")
     print(f"Output file: {output}")
 
     hash_progress: Optional[_HashProgress] = None
     if options.include_hash:
         print("Counting files and bytes for hash progress...", file=sys.stderr)
-        totals = _measure_hash_work(root, {_path_key(output)})
+        hash_exclusions = {_path_key(output)}
+        if hash_cache is not None:
+            cache_path = hash_cache.path
+            hash_exclusions.update(
+                _path_key(Path(os.fspath(cache_path) + suffix))
+                for suffix in ("", "-wal", "-shm", "-journal")
+            )
+        totals = _measure_hash_work(root, hash_exclusions)
         hash_progress = _HashProgress(
             totals=totals,
             stream=sys.stderr,
@@ -973,9 +1027,19 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
             hash_progress.finish(completed=False)
         print(f"Error: could not create snapshot: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if hash_cache is not None:
+            hash_cache.close()
 
     if hash_progress is not None:
         hash_progress.finish(completed=True)
+    if hash_cache is not None:
+        print(
+            f"Hash cache result: {hash_cache.stats.hits} reused, "
+            f"{hash_cache.stats.stores} updated, {hash_cache.stats.misses} misses"
+        )
+        if hash_cache.error_message:
+            print(f"Warning: hash cache disabled: {hash_cache.error_message}", file=sys.stderr)
 
     print(f"Snapshot written: {output}")
     print(
@@ -1003,14 +1067,46 @@ def _is_yes(value: str) -> bool:
     return value.casefold() in {"y", "yes", "1", "true"}
 
 
+def _run_interactive_cache() -> int:
+    print("Hash cache")
+    print()
+    print("[1] Show cache info")
+    print("[2] Clear all cache entries")
+    print("[3] Prune entries older than N days")
+    action = _prompt_value("Choose action (1/2/3, default 1): ")
+    if action is None or not action:
+        action = "1"
+    if action == "1":
+        return run_cache(["info"])
+    if action == "2":
+        confirm = _prompt_value("Clear the entire hash cache? (y/N): ")
+        if confirm is not None and _is_yes(confirm):
+            return run_cache(["clear"])
+        print("Cache was not cleared.")
+        return 0
+    if action == "3":
+        days_value = _prompt_value("Remove entries unused for how many days? (30): ")
+        days = days_value or "30"
+        if not days.isdigit():
+            print("Error: days must be a nonnegative integer.", file=sys.stderr)
+            return 2
+        return run_cache(["prune", "--days", days])
+    print("Error: unknown cache action.", file=sys.stderr)
+    return 2
+
+
 def _run_interactive() -> int:
     print("DirTree Snapshot")
     print()
     print("[1] Generate snapshot")
     print("[2] Compare two snapshots")
-    action = _prompt_value("Choose action (1/2, default 1): ")
+    print("[3] Manage hash cache")
+    action = _prompt_value("Choose action (1/2/3, default 1): ")
     if action is None:
         return 2
+
+    if action.casefold() in {"3", "cache"}:
+        return _run_interactive_cache()
 
     if action.casefold() in {"2", "c", "compare"}:
         left_value = _prompt_value("Left snapshot file: ")
@@ -1061,6 +1157,11 @@ def _run_interactive() -> int:
     snapshot_arguments = [_clean_path_argument(directory_value)]
     if _is_yes(hash_value):
         snapshot_arguments.append("--hash")
+        cache_value = _prompt_value("Use saved hash cache? (Y/n): ")
+        if cache_value is None:
+            return 2
+        if cache_value.casefold() in {"n", "no", "0", "false"}:
+            snapshot_arguments.append("--no-cache")
     if format_value != "html":
         snapshot_arguments.extend(["--format", format_value])
     return _run_snapshot(snapshot_arguments)
@@ -1072,6 +1173,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _run_interactive()
     if arguments[0].casefold() == "compare":
         return run_compare(arguments[1:])
+    if arguments[0].casefold() == "cache":
+        return run_cache(arguments[1:])
     return _run_snapshot(arguments)
 
 
