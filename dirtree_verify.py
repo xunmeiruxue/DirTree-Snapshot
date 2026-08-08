@@ -171,7 +171,7 @@ def run_verify(argv: Optional[Sequence[str]] = None) -> int:
         )
         excluded_paths = {
             dirtree._path_key(temporary_snapshot),
-            dirtree._path_key(snapshot_path),
+            dirtree._path_key(output),
         }
         _cache_exclusions(excluded_paths, cache)
 
