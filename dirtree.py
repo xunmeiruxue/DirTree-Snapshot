@@ -22,7 +22,7 @@ from dirtree_assets import load_text, render
 from dirtree_cache import HashCache, HashCacheError, run_cache
 from dirtree_compare import run_compare
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 HASH_CHUNK_SIZE = 1024 * 1024
 PROGRESS_REFRESH_SECONDS = 0.1
 WarningHandler = Callable[[Path, str], None]
@@ -735,6 +735,7 @@ def write_snapshot(
     options: SnapshotOptions,
     on_warning: Optional[WarningHandler] = None,
     hash_progress: Optional[_HashProgress] = None,
+    extra_excluded_paths: Optional[set[str]] = None,
 ) -> SnapshotStats:
     """Write a snapshot atomically and return its scan statistics."""
     root = _absolute_path(root)
@@ -751,6 +752,8 @@ def write_snapshot(
 
     stats = SnapshotStats()
     excluded_paths = {_path_key(output)}
+    if extra_excluded_paths:
+        excluded_paths.update(extra_excluded_paths)
     if options.hash_cache is not None:
         cache_path = options.hash_cache.path
         excluded_paths.update(
@@ -881,7 +884,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Create a deterministic directory tree snapshot for a single folder."
         ),
         epilog=(
-            "Compare snapshots: dirtree compare LEFT RIGHT; "
+            "Compare: dirtree compare LEFT RIGHT; "
+            "Verify: dirtree verify SNAPSHOT DIRECTORY; "
             "Manage cache: dirtree cache info|clear|prune"
         ),
     )
@@ -1067,6 +1071,44 @@ def _is_yes(value: str) -> bool:
     return value.casefold() in {"y", "yes", "1", "true"}
 
 
+def _run_interactive_verify() -> int:
+    snapshot_value = _prompt_value("Snapshot file: ")
+    if snapshot_value is None or not snapshot_value:
+        print("Error: a snapshot file is required.", file=sys.stderr)
+        return 2
+    directory_value = _prompt_value("Directory to verify: ")
+    if directory_value is None or not directory_value:
+        print("Error: a directory is required.", file=sys.stderr)
+        return 2
+    output_value = _prompt_value("Report file (Enter for automatic name): ")
+    if output_value is None:
+        return 2
+    hash_value = _prompt_value("Hash current files? (Y/n/auto): ")
+    if hash_value is None:
+        return 2
+    include_value = _prompt_value("Include unchanged items? (y/N): ")
+    if include_value is None:
+        return 2
+
+    verify_arguments = [
+        "verify",
+        _clean_path_argument(snapshot_value),
+        _clean_path_argument(directory_value),
+    ]
+    if output_value:
+        verify_arguments.extend(["-o", _clean_path_argument(output_value)])
+    if hash_value.casefold() in {"y", "yes", "1", "true"}:
+        verify_arguments.append("--hash")
+    elif hash_value.casefold() in {"n", "no", "0", "false"}:
+        verify_arguments.append("--no-hash")
+    if _is_yes(include_value):
+        verify_arguments.append("--include-unchanged")
+
+    from dirtree_verify import run_verify
+
+    return run_verify(verify_arguments[1:])
+
+
 def _run_interactive_cache() -> int:
     print("Hash cache")
     print()
@@ -1100,12 +1142,15 @@ def _run_interactive() -> int:
     print()
     print("[1] Generate snapshot")
     print("[2] Compare two snapshots")
-    print("[3] Manage hash cache")
-    action = _prompt_value("Choose action (1/2/3, default 1): ")
+    print("[3] Verify snapshot against directory")
+    print("[4] Manage hash cache")
+    action = _prompt_value("Choose action (1/2/3/4, default 1): ")
     if action is None:
         return 2
 
-    if action.casefold() in {"3", "cache"}:
+    if action.casefold() in {"3", "verify", "v"}:
+        return _run_interactive_verify()
+    if action.casefold() in {"4", "cache"}:
         return _run_interactive_cache()
 
     if action.casefold() in {"2", "c", "compare"}:
@@ -1173,6 +1218,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _run_interactive()
     if arguments[0].casefold() == "compare":
         return run_compare(arguments[1:])
+    if arguments[0].casefold() == "verify":
+        from dirtree_verify import run_verify
+
+        return run_verify(arguments[1:])
     if arguments[0].casefold() == "cache":
         return run_cache(arguments[1:])
     return _run_snapshot(arguments)
