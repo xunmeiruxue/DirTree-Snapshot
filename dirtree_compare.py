@@ -563,7 +563,7 @@ def default_compare_output(
     output_format: str,
     created_at: Optional[str] = None,
 ) -> Path:
-    extension = "html" if output_format == "html" else "txt"
+    extension = {"html": "html", "json": "json", "text": "txt"}.get(output_format, output_format)
     timestamp = _filename_timestamp(created_at or _current_timestamp())
     left_stem = _safe_output_stem(left)
     right_stem = _safe_output_stem(right)
@@ -584,6 +584,66 @@ def _format_entry_text(entry: Optional[ManifestEntry]) -> str:
         if entry.sha256:
             values.append(f"sha256={entry.sha256}")
     return ", ".join(values)
+
+
+def _entry_payload(entry: Optional[ManifestEntry]) -> Optional[dict[str, object]]:
+    if entry is None:
+        return None
+    payload: dict[str, object] = {"path": entry.path, "kind": entry.kind}
+    if entry.kind == "file":
+        payload["size"] = entry.size
+        if entry.sha256 is not None:
+            payload["sha256"] = entry.sha256
+    return payload
+
+
+def iter_json_report(
+    left: SnapshotData,
+    right: SnapshotData,
+    result: ComparisonResult,
+    include_unchanged: bool,
+    created_at: str,
+) -> Iterator[str]:
+    rows: list[dict[str, object]] = []
+    for row in result.rows:
+        if row.status == "same" and not include_unchanged:
+            continue
+        rows.append(
+            {
+                "status": row.status,
+                "status_label": _STATUS_LABELS[row.status],
+                "path": row.path,
+                "kind": row.kind,
+                "hash_verified": row.hash_verified,
+                "details": list(row.details),
+                "left": _entry_payload(row.left),
+                "right": _entry_payload(row.right),
+            }
+        )
+    payload = {
+        "schema": "dirtree.comparison",
+        "schema_version": COMPARE_FORMAT_VERSION,
+        "created_at": created_at,
+        "left": {
+            "name": left.source_name,
+            "format": left.source_format,
+            "created_at": left.created_at,
+        },
+        "right": {
+            "name": right.source_name,
+            "format": right.source_format,
+            "created_at": right.created_at,
+        },
+        "summary": {
+            **result.counts,
+            "differences": result.differences,
+            "hash_verified": result.hash_verified,
+            "unverified_files": result.unverified_files,
+        },
+        "warnings": list(result.warnings),
+        "entries": rows,
+    }
+    yield json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def iter_text_report(
@@ -710,7 +770,11 @@ def iter_html_report(
         SCRIPT=load_text("compare.js"),
     )
 
-def _write_report(path: Path, lines: Iterator[str]) -> None:
+def _write_report(
+    path: Path,
+    lines: Iterator[str],
+    encoding: str = "utf-8-sig",
+) -> None:
     path = Path(os.path.abspath(os.fspath(path)))
     if not path.parent.is_dir():
         raise ValueError(f"Output directory does not exist: {path.parent}")
@@ -724,7 +788,7 @@ def _write_report(path: Path, lines: Iterator[str]) -> None:
             dir=path.parent,
         )
         temporary_path = Path(temporary_name)
-        with os.fdopen(descriptor, "w", encoding="utf-8-sig", newline="\n") as output:
+        with os.fdopen(descriptor, "w", encoding=encoding, newline="\n") as output:
             descriptor = -1
             for line in lines:
                 output.write(line)
@@ -744,7 +808,7 @@ def _write_report(path: Path, lines: Iterator[str]) -> None:
 def build_compare_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dirtree compare",
-        description="Compare two DirTree Snapshot HTML or text files.",
+        description="Compare two DirTree Snapshot HTML, text, or JSON files.",
     )
     parser.add_argument("left", help="source or earlier snapshot")
     parser.add_argument("right", help="backup or later snapshot")
@@ -755,13 +819,13 @@ def build_compare_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        choices=("html", "text"),
-        help="report format; inferred from .txt, otherwise defaults to html",
+        choices=("html", "text", "json"),
+        help="report format; inferred from .txt/.json, otherwise defaults to html",
     )
     parser.add_argument(
         "--include-unchanged",
         action="store_true",
-        help="show unchanged items initially and include them in text reports",
+        help="show unchanged items initially and include them in text/JSON reports",
     )
     parser.add_argument(
         "--case-sensitive",
@@ -792,7 +856,12 @@ def run_compare(argv: Optional[Sequence[str]] = None) -> int:
 
     output_format = args.format
     if output_format is None:
-        output_format = "text" if output is not None and output.suffix.lower() == ".txt" else "html"
+        if output is not None and output.suffix.lower() == ".txt":
+            output_format = "text"
+        elif output is not None and output.suffix.lower() == ".json":
+            output_format = "json"
+        else:
+            output_format = "html"
     if output is None:
         output = default_compare_output(
             left_path,
@@ -818,6 +887,14 @@ def run_compare(argv: Optional[Sequence[str]] = None) -> int:
             args.include_unchanged,
             report_created_at,
         )
+    elif output_format == "json":
+        lines = iter_json_report(
+            left,
+            right,
+            result,
+            args.include_unchanged,
+            report_created_at,
+        )
     else:
         lines = iter_text_report(
             left,
@@ -828,7 +905,11 @@ def run_compare(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     try:
-        _write_report(absolute_output, lines)
+        _write_report(
+            absolute_output,
+            lines,
+            encoding="utf-8" if output_format == "json" else "utf-8-sig",
+        )
     except (OSError, ValueError) as exc:
         print(f"Error: could not write comparison report: {exc}", file=sys.stderr)
         return 1
@@ -842,6 +923,7 @@ def run_compare(argv: Optional[Sequence[str]] = None) -> int:
         f"{_display_timestamp(right.created_at)})"
     )
     print(f"Changed: {result.counts['changed']}")
+    print(f"Renamed: {result.counts['renamed']}")
     print(f"Added: {result.counts['added']}")
     print(f"Removed: {result.counts['removed']}")
     print(f"Same: {result.counts['same']}")
