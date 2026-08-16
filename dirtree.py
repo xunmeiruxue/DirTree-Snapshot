@@ -1037,7 +1037,7 @@ def default_output_path(
 
 _SCAN_CONFIG_KEYS = {
     "directory", "output", "format", "dirs_only", "hash", "metadata",
-    "no_cache", "exclude", "include",
+    "no_cache", "fast", "exclude", "include",
 }
 
 
@@ -1060,7 +1060,7 @@ def _load_scan_config(path_value: str) -> tuple[Path, dict[str, object]]:
     for key in ("directory", "output", "format"):
         if key in payload and not isinstance(payload[key], str):
             raise ValueError(f"Scan config field {key!r} must be a string")
-    for key in ("dirs_only", "hash", "metadata", "no_cache"):
+    for key in ("dirs_only", "hash", "metadata", "no_cache", "fast"):
         if key in payload and not isinstance(payload[key], bool):
             raise ValueError(f"Scan config field {key!r} must be true or false")
     for key in ("exclude", "include"):
@@ -1133,6 +1133,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="include timestamps, permissions, mode, and read-only metadata",
     )
     parser.add_argument(
+        "--fast",
+        action="store_true",
+        default=None,
+        help="skip the hash workload pre-scan for large directories",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         default=None,
@@ -1182,6 +1188,7 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     include_hash = args.hash if args.hash is not None else bool(config.get("hash", False))
     include_metadata = args.metadata if args.metadata is not None else bool(config.get("metadata", False))
     no_cache = args.no_cache if args.no_cache is not None else bool(config.get("no_cache", False))
+    fast_scan = args.fast if args.fast is not None else bool(config.get("fast", False))
     exclude_patterns = tuple(args.exclude if args.exclude is not None else config.get("exclude", []))
     include_patterns = tuple(args.include if args.include is not None else config.get("include", []))
     if args.output is not None:
@@ -1256,6 +1263,7 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     print(f"Scanning: {root}")
     print(f"Output format: {options.output_format}")
     print(f"SHA-256: {'enabled' if options.include_hash else 'disabled'}")
+    print(f"Fast scan: {'enabled' if fast_scan else 'disabled'}")
     if options.include_hash:
         cache_label = str(hash_cache.path) if hash_cache is not None else "disabled"
         print(f"Hash cache: {cache_label}")
@@ -1263,7 +1271,9 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     print(f"Output file: {output}")
 
     hash_progress: Optional[_HashProgress] = None
-    if options.include_hash:
+    if options.include_hash and fast_scan:
+        print("Fast scan enabled: skipping hash workload pre-scan.", file=sys.stderr)
+    elif options.include_hash:
         print("Counting files and bytes for hash progress...", file=sys.stderr)
         hash_exclusions = {_path_key(output)}
         if hash_cache is not None:
@@ -1482,6 +1492,11 @@ def _run_interactive() -> int:
         snapshot_arguments.append("--metadata")
     if _is_yes(hash_value):
         snapshot_arguments.append("--hash")
+        fast_value = _prompt_value("Fast scan for large directories? (y/N): ")
+        if fast_value is None:
+            return 2
+        if _is_yes(fast_value):
+            snapshot_arguments.append("--fast")
         cache_value = _prompt_value("Use saved hash cache? (Y/n): ")
         if cache_value is None:
             return 2

@@ -6,6 +6,7 @@
   "hash": true,
   "metadata": true,
   "no_cache": false,
+  "fast": true,
   "exclude": [
     ".git",
     "node_modules",
