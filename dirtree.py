@@ -1042,7 +1042,12 @@ _SCAN_CONFIG_KEYS = {
 
 
 def _load_scan_config(path_value: str) -> tuple[Path, dict[str, object]]:
-    path = _absolute_path(Path(_clean_path_argument(path_value)))
+    requested = Path(_clean_path_argument(path_value))
+    path = _absolute_path(requested)
+    if not requested.is_absolute() and not path.is_file():
+        launcher_candidate = _absolute_path(Path(__file__).parent / requested)
+        if launcher_candidate.is_file():
+            path = launcher_candidate
     try:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -1163,18 +1168,30 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
             print(f"Error: {exc}", file=sys.stderr)
             return 2
 
-    directory_value = args.directory or config.get("directory")
+    if args.directory is not None:
+        directory_value = args.directory
+    else:
+        configured_directory = config.get("directory")
+        directory_value = _config_path(
+            configured_directory if isinstance(configured_directory, str) else None,
+            config_path,
+        )
     if not isinstance(directory_value, str) or not directory_value:
         directory_value = None
-    directory_value = _config_path(directory_value, config_path)
     dirs_only = args.dirs_only if args.dirs_only is not None else bool(config.get("dirs_only", False))
     include_hash = args.hash if args.hash is not None else bool(config.get("hash", False))
     include_metadata = args.metadata if args.metadata is not None else bool(config.get("metadata", False))
     no_cache = args.no_cache if args.no_cache is not None else bool(config.get("no_cache", False))
     exclude_patterns = tuple(args.exclude if args.exclude is not None else config.get("exclude", []))
     include_patterns = tuple(args.include if args.include is not None else config.get("include", []))
-    output_value = args.output if args.output is not None else config.get("output")
-    output_value = _config_path(output_value if isinstance(output_value, str) else None, config_path)
+    if args.output is not None:
+        output_value = args.output
+    else:
+        configured_output = config.get("output")
+        output_value = _config_path(
+            configured_output if isinstance(configured_output, str) else None,
+            config_path,
+        )
     output_format = args.format if args.format is not None else config.get("format")
     if output_format is not None and not isinstance(output_format, str):
         parser.error("output format must be a string")
@@ -1396,7 +1413,8 @@ def _run_interactive() -> int:
     print("[2] Compare two snapshots")
     print("[3] Verify snapshot against directory")
     print("[4] Manage hash cache")
-    action = _prompt_value("Choose action (1/2/3/4, default 1): ")
+    print("[5] Generate snapshot from config")
+    action = _prompt_value("Choose action (1/2/3/4/5, default 1): ")
     if action is None:
         return 2
 
@@ -1404,6 +1422,11 @@ def _run_interactive() -> int:
         return _run_interactive_verify()
     if action.casefold() in {"4", "cache"}:
         return _run_interactive_cache()
+    if action.casefold() in {"5", "config"}:
+        config_value = _prompt_value("Config file (default dirtree.example.json): ")
+        if config_value is None:
+            return 2
+        return _run_snapshot(["--config", _clean_path_argument(config_value or "dirtree.example.json")])
 
     if action.casefold() in {"2", "c", "compare"}:
         left_value = _prompt_value("Left snapshot file: ")
@@ -1443,6 +1466,9 @@ def _run_interactive() -> int:
     hash_value = _prompt_value("Calculate SHA-256 hashes? (y/N): ")
     if hash_value is None:
         return 2
+    metadata_value = _prompt_value("Include file metadata? (y/N): ")
+    if metadata_value is None:
+        return 2
     format_value = _prompt_value("Output format (html/text/json, default html): ")
     if format_value is None:
         return 2
@@ -1452,6 +1478,8 @@ def _run_interactive() -> int:
         return 2
 
     snapshot_arguments = [_clean_path_argument(directory_value)]
+    if _is_yes(metadata_value):
+        snapshot_arguments.append("--metadata")
     if _is_yes(hash_value):
         snapshot_arguments.append("--hash")
         cache_value = _prompt_value("Use saved hash cache? (Y/n): ")
