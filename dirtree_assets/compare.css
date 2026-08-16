@@ -15,6 +15,8 @@
   --removed-soft: #fdf0f0;
   --changed: #a96608;
   --changed-soft: #fff7e8;
+  --renamed: #6d4aa2;
+  --renamed-soft: #f3effa;
   --same: #60717a;
   --same-soft: #f0f3f4;
   --warning: #85560a;
@@ -73,7 +75,7 @@ h1 { margin: 0; font-size: 28px; font-weight: 680; line-height: 1.2; letter-spac
 .snapshot-arrow { color: var(--muted); text-align: center; font-weight: 700; }
 .metrics {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   margin: 22px 0 0;
   border-top: 1px solid var(--line);
 }
@@ -154,6 +156,7 @@ th:nth-child(4), th:nth-child(5) { width: 23%; }
 .status-added { color: var(--added); background: var(--added-soft); }
 .status-removed { color: var(--removed); background: var(--removed-soft); }
 .status-changed { color: var(--changed); background: var(--changed-soft); }
+.status-renamed { color: var(--renamed); background: var(--renamed-soft); }
 .status-same { color: var(--same); background: var(--same-soft); }
 .path-value { display: block; overflow-wrap: anywhere; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
 .reason { margin-top: 5px; color: var(--muted); font-size: 12px; }

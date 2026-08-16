@@ -18,13 +18,13 @@ from typing import Iterator, Optional, Sequence
 
 from dirtree_assets import load_text, render
 
-COMPARE_FORMAT_VERSION = 1
+COMPARE_FORMAT_VERSION = 2
 _HASH_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _FILE_DETAILS_PATTERN = re.compile(
     r" \[size=(?P<size>\d+|\?) B(?:, sha256=(?P<hash>[0-9a-fA-F]{64}|unreadable))?\]$"
 )
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_STATUS_ORDER = {"changed": 0, "removed": 1, "added": 2, "same": 3}
+_STATUS_ORDER = {"changed": 0, "renamed": 1, "removed": 2, "added": 3, "same": 4}
 _KIND_LABELS = {
     "directory": "目录",
     "file": "文件",
@@ -36,6 +36,7 @@ _STATUS_LABELS = {
     "added": "新增",
     "removed": "缺失",
     "changed": "已更改",
+    "renamed": "已重命名",
     "same": "相同",
 }
 
@@ -78,7 +79,12 @@ class ComparisonResult:
 
     @property
     def differences(self) -> int:
-        return self.counts["added"] + self.counts["removed"] + self.counts["changed"]
+        return (
+            self.counts["added"]
+            + self.counts["removed"]
+            + self.counts["changed"]
+            + self.counts["renamed"]
+        )
 
 
 class _SnapshotHTMLParser(HTMLParser):
@@ -366,9 +372,45 @@ def compare_snapshots(
     hash_verified = 0
     unverified_files = 0
 
-    for key in sorted(set(left_entries) | set(right_entries), key=str.casefold):
-        left = left_entries.get(key)
-        right = right_entries.get(key)
+    # Match only unique hashes among unmatched files. Ambiguous duplicate hashes
+    # remain added/removed instead of being guessed as renames.
+    left_hashes: dict[str, list[tuple[str, ManifestEntry]]] = {}
+    right_hashes: dict[str, list[tuple[str, ManifestEntry]]] = {}
+    for key, entry in left_entries.items():
+        if entry.kind == "file" and _usable_hash(entry.sha256):
+            left_hashes.setdefault(entry.sha256.lower(), []).append((key, entry))
+    for key, entry in right_entries.items():
+        if entry.kind == "file" and _usable_hash(entry.sha256):
+            right_hashes.setdefault(entry.sha256.lower(), []).append((key, entry))
+
+    renamed_by_left: dict[str, tuple[str, ManifestEntry]] = {}
+    renamed_by_right: dict[str, tuple[str, ManifestEntry]] = {}
+    for digest, left_matches in left_hashes.items():
+        right_matches = right_hashes.get(digest, [])
+        if len(left_matches) == 1 and len(right_matches) == 1:
+            left_key, left_entry = left_matches[0]
+            right_key, right_entry = right_matches[0]
+            if left_key not in right_entries and right_key not in left_entries:
+                renamed_by_left[left_key] = (right_key, right_entry)
+                renamed_by_right[right_key] = (left_key, left_entry)
+                rows.append(
+                    ComparisonRow(
+                        status="renamed",
+                        path=right_entry.path,
+                        kind="file",
+                        left=left_entry,
+                        right=right_entry,
+                        details=(f"重命名：{left_entry.path} -> {right_entry.path}",),
+                        hash_verified=True,
+                    )
+                )
+                hash_verified += 1
+
+    remaining_left = set(left_entries) - set(renamed_by_left)
+    remaining_right = set(right_entries) - set(renamed_by_right)
+    for key in sorted(remaining_left | remaining_right, key=str.casefold):
+        left = left_entries.get(key) if key in remaining_left else None
+        right = right_entries.get(key) if key in remaining_right else None
 
         if left is None and right is not None:
             rows.append(
@@ -559,8 +601,9 @@ def iter_text_report(
     yield f"# Right created: {right.created_at or 'unknown'}"
     yield (
         "# Summary: "
-        f"changed={result.counts['changed']} added={result.counts['added']} "
-        f"removed={result.counts['removed']} same={result.counts['same']} "
+        f"changed={result.counts['changed']} renamed={result.counts['renamed']} "
+        f"added={result.counts['added']} removed={result.counts['removed']} "
+        f"same={result.counts['same']} "
         f"hash-verified={result.hash_verified}"
     )
     yield ""
@@ -633,6 +676,7 @@ def iter_html_report(
         RIGHT_NAME=html.escape(right.source_name),
         RIGHT_CREATED=html.escape(_display_timestamp(right.created_at)),
         CHANGED=str(result.counts["changed"]),
+        RENAMED=str(result.counts["renamed"]),
         ADDED=str(result.counts["added"]),
         REMOVED=str(result.counts["removed"]),
         SAME=str(result.counts["same"]),

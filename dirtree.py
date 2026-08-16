@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import html
 import json
@@ -32,8 +33,12 @@ WarningHandler = Callable[[Path, str], None]
 class SnapshotOptions:
     directories_only: bool = False
     include_hash: bool = False
+    include_metadata: bool = False
     output_format: str = "html"
     created_at: Optional[str] = None
+    root: Optional[Path] = field(default=None, compare=False, repr=False)
+    exclude_patterns: tuple[str, ...] = ()
+    include_patterns: tuple[str, ...] = ()
     hash_cache: Optional[HashCache] = field(default=None, compare=False, repr=False)
 
 
@@ -46,11 +51,20 @@ class SnapshotStats:
 
 
 @dataclass(frozen=True)
+class _EntryMetadata:
+    modified_at: str
+    metadata_changed_at: str
+    mode: str
+    readonly: bool
+
+
+@dataclass(frozen=True)
 class _TreeEntry:
     path: Path
     name: str
     kind: str
     size: Optional[int] = None
+    metadata: Optional[_EntryMetadata] = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +197,85 @@ def _display_name(name: str) -> str:
     return name.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
 
 
+def _metadata_timestamp(value: float) -> str:
+    return datetime.fromtimestamp(value).astimezone().isoformat(timespec="seconds")
+
+
+def _metadata_from_stat(stat_result: os.stat_result) -> _EntryMetadata:
+    writable_bits = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    readonly = not bool(stat_result.st_mode & writable_bits)
+    readonly_flag = getattr(stat, "FILE_ATTRIBUTE_READONLY", 0)
+    attributes = getattr(stat_result, "st_file_attributes", 0)
+    if readonly_flag:
+        readonly = readonly or bool(attributes & readonly_flag)
+    return _EntryMetadata(
+        modified_at=_metadata_timestamp(stat_result.st_mtime),
+        metadata_changed_at=_metadata_timestamp(stat_result.st_ctime),
+        mode=stat.filemode(stat_result.st_mode),
+        readonly=readonly,
+    )
+
+
+def _metadata_payload(metadata: Optional[_EntryMetadata]) -> Optional[dict[str, object]]:
+    if metadata is None:
+        return None
+    return {
+        "modified_at": metadata.modified_at,
+        "metadata_changed_at": metadata.metadata_changed_at,
+        "mode": metadata.mode,
+        "readonly": metadata.readonly,
+    }
+
+
+def _format_text_metadata(metadata: Optional[_EntryMetadata], enabled: bool) -> str:
+    if not enabled or metadata is None:
+        return ""
+    return (
+        f" [modified={metadata.modified_at}, changed={metadata.metadata_changed_at}, "
+        f"mode={metadata.mode}, readonly={str(metadata.readonly).lower()}]"
+    )
+
+
+def _metadata_html(metadata: Optional[_EntryMetadata], enabled: bool) -> str:
+    if not enabled or metadata is None:
+        return ""
+    readonly_label = "是" if metadata.readonly else "否"
+    return (
+        '<div class="node-meta metadata-meta">'
+        f'<span class="node-meta-label">元数据</span>'
+        f'<span>修改：{html.escape(metadata.modified_at)}；变更：{html.escape(metadata.metadata_changed_at)}；'
+        f'模式：{html.escape(metadata.mode)}；只读：{readonly_label}</span></div>'
+    )
+
+
+def _rule_matches(relative_path: str, name: str, pattern: str) -> bool:
+    normalized_pattern = pattern.replace("\\", "/")
+    while normalized_pattern.startswith("./"):
+        normalized_pattern = normalized_pattern[2:]
+    return (
+        fnmatch.fnmatchcase(relative_path, normalized_pattern)
+        or fnmatch.fnmatchcase(name, normalized_pattern)
+    )
+
+
+def _entry_allowed(path: Path, kind: str, options: SnapshotOptions) -> bool:
+    root = options.root
+    if root is None:
+        relative_path = path.name
+    else:
+        try:
+            relative_path = path.relative_to(root).as_posix()
+        except ValueError:
+            relative_path = path.name
+    name = path.name
+
+    if any(_rule_matches(relative_path, name, pattern) for pattern in options.exclude_patterns):
+        return False
+    if not options.include_patterns or kind == "directory":
+        return True
+    return any(_rule_matches(relative_path, name, pattern) for pattern in options.include_patterns)
+
+
 def _is_link_or_reparse_point(entry: os.DirEntry[str]) -> bool:
     if entry.is_symlink():
         return True
@@ -238,18 +331,33 @@ def _read_entries(
                     kind = "unreadable"
                     _report_error(stats, on_warning, path, str(exc))
 
+                if not _entry_allowed(path, kind, options):
+                    continue
                 if options.directories_only and kind == "file":
                     continue
 
                 size: Optional[int] = None
                 if kind == "file":
                     try:
-                        size = entry.stat(follow_symlinks=False).st_size
+                        stat_result = entry.stat(follow_symlinks=False)
+                        size = stat_result.st_size
+                    except OSError as exc:
+                        _report_error(stats, on_warning, path, str(exc))
+                if options.include_metadata:
+                    try:
+                        stat_result = stat_result or entry.stat(follow_symlinks=False)
+                        entry_metadata = _metadata_from_stat(stat_result)
                     except OSError as exc:
                         _report_error(stats, on_warning, path, str(exc))
 
                 entries.append(
-                    _TreeEntry(path=path, name=entry.name, kind=kind, size=size)
+                    _TreeEntry(
+                        path=path,
+                        name=entry.name,
+                        kind=kind,
+                        size=size,
+                        metadata=entry_metadata,
+                    )
                 )
     except OSError as exc:
         _report_error(stats, on_warning, directory, str(exc))
@@ -608,6 +716,7 @@ def _iter_html_directory(
                 on_warning,
                 hash_progress,
             )
+            yield _metadata_html(entry.metadata, options.include_metadata)
             yield f'{indent}    </ul>'
             yield f'{indent}  </details>'
             yield f'{indent}</li>'
@@ -647,7 +756,8 @@ def _iter_html_directory(
                 f'{indent}<li class="tree-item link-item" data-kind="link" data-search="{search_path}">'
                 f'<div class="node-row"><span class="chevron-spacer"></span>'
                 f'{_html_icon("link", "node-icon link-icon")}<span class="node-name">{name}'
-                '<span class="node-badge">链接，未跟随</span></span><span></span></div></li>'
+                '<span class="node-badge">链接，未跟随</span></span><span></span></div>'
+                f"{_metadata_html(entry.metadata, options.include_metadata)}</li>"
             )
         elif entry.kind == "other":
             yield (
@@ -740,6 +850,8 @@ def write_snapshot(
     """Write a snapshot atomically and return its scan statistics."""
     root = _absolute_path(root)
     output = _absolute_path(output)
+    if options.root != root:
+        options = replace(options, root=root)
     if options.created_at is None:
         options = replace(options, created_at=_current_timestamp())
 
@@ -916,9 +1028,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="include SHA-256 hashes and show hashing progress",
     )
     parser.add_argument(
+        "--metadata",
+        action="store_true",
+        help="include timestamps, permissions, mode, and read-only metadata",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="calculate hashes without reading or updating the local cache",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="exclude matching files or directories; may be repeated",
+    )
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="include matching files or links; may be repeated",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
