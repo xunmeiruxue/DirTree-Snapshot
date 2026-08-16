@@ -1035,6 +1035,47 @@ def default_output_path(
     return _next_available_path(path)
 
 
+_SCAN_CONFIG_KEYS = {
+    "directory", "output", "format", "dirs_only", "hash", "metadata",
+    "no_cache", "exclude", "include",
+}
+
+
+def _load_scan_config(path_value: str) -> tuple[Path, dict[str, object]]:
+    path = _absolute_path(Path(_clean_path_argument(path_value)))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read scan config {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Scan config must contain a JSON object")
+    unknown = sorted(set(payload) - _SCAN_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown scan config field(s): {', '.join(unknown)}")
+    for key in ("directory", "output", "format"):
+        if key in payload and not isinstance(payload[key], str):
+            raise ValueError(f"Scan config field {key!r} must be a string")
+    for key in ("dirs_only", "hash", "metadata", "no_cache"):
+        if key in payload and not isinstance(payload[key], bool):
+            raise ValueError(f"Scan config field {key!r} must be true or false")
+    for key in ("exclude", "include"):
+        value = payload.get(key)
+        if value is not None and (
+            not isinstance(value, list) or not all(isinstance(item, str) for item in value)
+        ):
+            raise ValueError(f"Scan config field {key!r} must be a string array")
+    if payload.get("format") not in (None, "html", "text", "json"):
+        raise ValueError("Scan config format must be html, text, or json")
+    return path, payload
+
+
+def _config_path(value: Optional[str], config_path: Optional[Path]) -> Optional[str]:
+    if value is None or config_path is None:
+        return value
+    expanded = Path(_clean_path_argument(value))
+    return os.fspath(expanded if expanded.is_absolute() else config_path.parent / expanded)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dirtree",
@@ -1046,6 +1087,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Verify: dirtree verify SNAPSHOT DIRECTORY; "
             "Manage cache: dirtree cache info|clear|prune"
         ),
+    )
+    parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help="reuse scan settings from a JSON configuration file",
     )
     parser.add_argument(
         "directory",
@@ -1066,34 +1112,38 @@ def build_parser() -> argparse.ArgumentParser:
         "-d",
         "--dirs-only",
         action="store_true",
+        default=None,
         help="include directories and links, but omit regular files",
     )
     parser.add_argument(
         "--hash",
         action="store_true",
+        default=None,
         help="include SHA-256 hashes and show hashing progress",
     )
     parser.add_argument(
         "--metadata",
         action="store_true",
+        default=None,
         help="include timestamps, permissions, mode, and read-only metadata",
     )
     parser.add_argument(
         "--no-cache",
         action="store_true",
+        default=None,
         help="calculate hashes without reading or updating the local cache",
     )
     parser.add_argument(
         "--exclude",
         action="append",
-        default=[],
+        default=None,
         metavar="PATTERN",
         help="exclude matching files or directories; may be repeated",
     )
     parser.add_argument(
         "--include",
         action="append",
-        default=[],
+        default=None,
         metavar="PATTERN",
         help="include matching files or links; may be repeated",
     )
@@ -1104,13 +1154,36 @@ def build_parser() -> argparse.ArgumentParser:
 def _run_snapshot(arguments: Sequence[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(arguments)
+    config_path: Optional[Path] = None
+    config: dict[str, object] = {}
+    if args.config:
+        try:
+            config_path, config = _load_scan_config(args.config)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
 
-    if args.dirs_only and args.hash:
+    directory_value = args.directory or config.get("directory")
+    if not isinstance(directory_value, str) or not directory_value:
+        directory_value = None
+    directory_value = _config_path(directory_value, config_path)
+    dirs_only = args.dirs_only if args.dirs_only is not None else bool(config.get("dirs_only", False))
+    include_hash = args.hash if args.hash is not None else bool(config.get("hash", False))
+    include_metadata = args.metadata if args.metadata is not None else bool(config.get("metadata", False))
+    no_cache = args.no_cache if args.no_cache is not None else bool(config.get("no_cache", False))
+    exclude_patterns = tuple(args.exclude if args.exclude is not None else config.get("exclude", []))
+    include_patterns = tuple(args.include if args.include is not None else config.get("include", []))
+    output_value = args.output if args.output is not None else config.get("output")
+    output_value = _config_path(output_value if isinstance(output_value, str) else None, config_path)
+    output_format = args.format if args.format is not None else config.get("format")
+    if output_format is not None and not isinstance(output_format, str):
+        parser.error("output format must be a string")
+
+    if dirs_only and include_hash:
         parser.error("--hash cannot be combined with --dirs-only")
-    if args.no_cache and not args.hash:
+    if no_cache and not include_hash:
         parser.error("--no-cache requires --hash")
 
-    directory_value = args.directory
     if directory_value is None:
         print("Error: no directory was provided.", file=sys.stderr)
         return 2
@@ -1127,14 +1200,12 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
 
     created_at = _current_timestamp()
     output: Optional[Path] = None
-    if args.output:
-        cleaned_output = _clean_path_argument(args.output)
+    if output_value:
+        cleaned_output = _clean_path_argument(output_value)
         if not cleaned_output:
             print("Error: the output path is empty.", file=sys.stderr)
             return 2
         output = _absolute_path(Path(cleaned_output))
-
-    output_format = args.format
     if output_format is None:
         if output is not None and output.suffix.lower() == ".txt":
             output_format = "text"
@@ -1147,21 +1218,21 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
         output = _absolute_path(default_output_path(root, output_format, created_at))
 
     hash_cache: Optional[HashCache] = None
-    if args.hash and not args.no_cache:
+    if include_hash and not no_cache:
         try:
             hash_cache = HashCache()
         except HashCacheError as exc:
             print(f"Warning: {exc}; continuing without cache.", file=sys.stderr)
 
     options = SnapshotOptions(
-        directories_only=args.dirs_only,
-        include_hash=args.hash,
-        include_metadata=args.metadata,
+        directories_only=dirs_only,
+        include_hash=include_hash,
+        include_metadata=include_metadata,
         output_format=output_format,
         created_at=created_at,
         root=root,
-        exclude_patterns=tuple(args.exclude),
-        include_patterns=tuple(args.include),
+        exclude_patterns=exclude_patterns,
+        include_patterns=include_patterns,
         hash_cache=hash_cache,
     )
 

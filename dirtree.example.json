@@ -1,0 +1,15 @@
+{
+  "directory": "./project",
+  "output": "./project-tree.json",
+  "format": "json",
+  "dirs_only": false,
+  "hash": true,
+  "metadata": true,
+  "no_cache": false,
+  "exclude": [
+    ".git",
+    "node_modules",
+    "*.tmp"
+  ],
+  "include": []
+}
