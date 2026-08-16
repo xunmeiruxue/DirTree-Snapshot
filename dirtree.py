@@ -337,6 +337,8 @@ def _read_entries(
                     continue
 
                 size: Optional[int] = None
+                entry_metadata: Optional[_EntryMetadata] = None
+                stat_result: Optional[os.stat_result] = None
                 if kind == "file":
                     try:
                         stat_result = entry.stat(follow_symlinks=False)
@@ -368,7 +370,11 @@ def _read_entries(
     return entries
 
 
-def _measure_hash_work(root: Path, excluded_paths: set[str]) -> _HashTotals:
+def _measure_hash_work(
+    root: Path,
+    excluded_paths: set[str],
+    options: Optional[SnapshotOptions] = None,
+) -> _HashTotals:
     total_files = 0
     total_bytes = 0
     directories = [root]
@@ -386,6 +392,8 @@ def _measure_hash_work(root: Path, excluded_paths: set[str]) -> _HashTotals:
                     except OSError:
                         continue
 
+                    if options is not None and not _entry_allowed(path, kind, options):
+                        continue
                     if kind == "directory":
                         directories.append(path)
                     elif kind == "file":
@@ -452,12 +460,17 @@ def _collect_file_details(
     return _FileDetails(size=entry.size, sha256=sha256_value)
 
 
-def _format_text_file_details(details: _FileDetails, include_hash: bool) -> str:
+def _format_text_file_details(
+    details: _FileDetails,
+    include_hash: bool,
+    metadata: Optional[_EntryMetadata],
+    include_metadata: bool,
+) -> str:
     size_text = str(details.size) if details.size is not None else "?"
     values = [f"size={size_text} B"]
     if include_hash:
         values.append(f"sha256={details.sha256 or 'unreadable'}")
-    return f" [{', '.join(values)}]"
+    return f" [{', '.join(values)}]" + _format_text_metadata(metadata, include_metadata)
 
 
 def _iter_directory(
@@ -482,7 +495,10 @@ def _iter_directory(
 
         if entry.kind == "directory":
             stats.directories += 1
-            yield f"{prefix}{connector}{name}/"
+            yield (
+                f"{prefix}{connector}{name}/"
+                + _format_text_metadata(entry.metadata, options.include_metadata)
+            )
             yield from _iter_directory(
                 entry.path,
                 child_prefix,
@@ -501,11 +517,19 @@ def _iter_directory(
                 on_warning,
                 hash_progress,
             )
-            detail_text = _format_text_file_details(details, options.include_hash)
+            detail_text = _format_text_file_details(
+                details,
+                options.include_hash,
+                entry.metadata,
+                options.include_metadata,
+            )
             yield f"{prefix}{connector}{name}{detail_text}"
         elif entry.kind == "link":
             stats.links += 1
-            yield f"{prefix}{connector}{name} [link-not-followed]"
+            yield (
+                f"{prefix}{connector}{name} [link-not-followed]"
+                + _format_text_metadata(entry.metadata, options.include_metadata)
+            )
         elif entry.kind == "other":
             yield f"{prefix}{connector}{name} [special-file]"
         else:
@@ -531,7 +555,10 @@ def _collect_json_entries(
         relative_path = "/".join(current_parts)
         if entry.kind == "directory":
             stats.directories += 1
-            result.append({"path": relative_path, "kind": "directory"})
+            item: dict[str, object] = {"path": relative_path, "kind": "directory"}
+            if options.include_metadata:
+                item["metadata"] = _metadata_payload(entry.metadata)
+            result.append(item)
             result.extend(
                 _collect_json_entries(
                     entry.path,
@@ -559,12 +586,20 @@ def _collect_json_entries(
             }
             if options.include_hash:
                 item["sha256"] = details.sha256 or "unreadable"
+            if options.include_metadata:
+                item["metadata"] = _metadata_payload(entry.metadata)
             result.append(item)
         elif entry.kind == "link":
             stats.links += 1
-            result.append({"path": relative_path, "kind": "link"})
+            item = {"path": relative_path, "kind": "link"}
+            if options.include_metadata:
+                item["metadata"] = _metadata_payload(entry.metadata)
+            result.append(item)
         elif entry.kind == "other":
-            result.append({"path": relative_path, "kind": "special"})
+            item = {"path": relative_path, "kind": "special"}
+            if options.include_metadata:
+                item["metadata"] = _metadata_payload(entry.metadata)
+            result.append(item)
         else:
             result.append({"path": relative_path, "kind": "unreadable"})
     return result
@@ -590,6 +625,8 @@ def iter_snapshot_json(
     )
     mode = "directories-only" if options.directories_only else "files-and-directories"
     details = "none" if options.directories_only else "size-bytes"
+    if options.include_metadata:
+        details += ",metadata"
     if options.include_hash:
         details += ",sha256"
     root_name = root.name or root.drive.rstrip(":\\/") or "root"
@@ -629,6 +666,8 @@ def iter_snapshot_lines(
     yield f"# Created: {options.created_at or _current_timestamp()}"
     mode = "directories-only" if options.directories_only else "files-and-directories"
     details = "none" if options.directories_only else "size-bytes"
+    if options.include_metadata:
+        details += ",metadata"
     if options.include_hash:
         details += ",sha256"
     yield f"# Mode: {mode}"
@@ -749,6 +788,9 @@ def _iter_html_directory(
                     f'{indent}  <div class="node-meta"><span class="node-meta-label">SHA-256</span>'
                     f'<code class="hash-value{hash_class}">{html.escape(hash_value)}</code></div>'
                 )
+            metadata_html = _metadata_html(entry.metadata, options.include_metadata)
+            if metadata_html:
+                yield f"{indent}  {metadata_html}"
             yield f'{indent}</li>'
         elif entry.kind == "link":
             stats.links += 1
@@ -792,6 +834,10 @@ def iter_snapshot_html(
     created_display = html.escape(_display_timestamp(created_at))
     if options.directories_only:
         mode_label = "仅目录"
+    elif options.include_hash and options.include_metadata:
+        mode_label = "目录、文件大小、元数据与 SHA-256"
+    elif options.include_metadata:
+        mode_label = "目录、文件大小与元数据"
     elif options.include_hash:
         mode_label = "目录、文件大小与 SHA-256"
     else:
@@ -1110,8 +1156,12 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     options = SnapshotOptions(
         directories_only=args.dirs_only,
         include_hash=args.hash,
+        include_metadata=args.metadata,
         output_format=output_format,
         created_at=created_at,
+        root=root,
+        exclude_patterns=tuple(args.exclude),
+        include_patterns=tuple(args.include),
         hash_cache=hash_cache,
     )
 
@@ -1134,7 +1184,7 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
                 _path_key(Path(os.fspath(cache_path) + suffix))
                 for suffix in ("", "-wal", "-shm", "-journal")
             )
-        totals = _measure_hash_work(root, hash_exclusions)
+        totals = _measure_hash_work(root, hash_exclusions, options)
         hash_progress = _HashProgress(
             totals=totals,
             stream=sys.stderr,
