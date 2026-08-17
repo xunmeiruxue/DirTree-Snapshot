@@ -22,6 +22,7 @@
       <div class="metric"><dt>目录</dt><dd data-stat="directories">0</dd></div>
       <div class="metric"><dt>文件</dt><dd data-stat="files">0</dd></div>
       <div class="metric"><dt>链接</dt><dd data-stat="links">0</dd></div>
+      <div class="metric"><dt>总大小</dt><dd data-stat="bytes">0 B</dd></div>
       <div class="metric metric-errors"><dt>错误</dt><dd data-stat="errors">0</dd></div>
     </dl>
   </div>
@@ -34,9 +35,23 @@
         <svg class="search-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg>
         <input id="tree-search" type="search" autocomplete="off" placeholder="搜索文件或目录">
       </label>
+      <div class="toolbar-filters">
+        <label><span class="sr-only">项目类型</span><select id="kind-filter">
+          <option value="all">所有类型</option>
+          <option value="file">文件</option>
+          <option value="directory">目录</option>
+          <option value="link">链接</option>
+        </select></label>
+        <label><span class="sr-only">文件大小</span><select id="size-filter">
+          <option value="all">所有大小</option>
+          <option value="1m">至少 1 MiB</option>
+          <option value="100m">至少 100 MiB</option>
+        </select></label>
+      </div>
       <div class="toolbar-actions">
         <button id="expand-all" type="button">全部展开</button>
         <button id="collapse-all" type="button">全部折叠</button>
+        <button id="theme-toggle" class="icon-button" type="button" aria-label="切换深色模式" title="切换深色模式"><svg aria-hidden="true" viewBox="0 0 24 24"><use href="#icon-moon"></use></svg></button>
         <output id="match-count" class="match-count" aria-live="polite"></output>
       </div>
     </div>

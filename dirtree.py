@@ -779,7 +779,9 @@ def _iter_html_directory(
                 f'{indent}  <div class="node-row"><span class="chevron-spacer"></span>'
                 f'{_html_icon("file", "node-icon file-icon")}'
                 f'<span class="node-name">{name}</span>'
-                f'<span class="node-size" data-bytes="{size_value}">{size_label}</span></div>'
+                f'<span class="node-size" data-bytes="{size_value}">{size_label}</span>'
+                f'<button class="copy-path" type="button" data-copy-path="{search_path}" aria-label="复制相对路径" title="复制相对路径">'
+                f'{_html_icon("copy", "copy-icon")}</button></div>'
             )
             if options.include_hash:
                 hash_value = details.sha256 or "unreadable"
