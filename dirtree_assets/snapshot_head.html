@@ -33,7 +33,7 @@
       <label class="search-field">
         <span class="sr-only">搜索文件或目录</span>
         <svg class="search-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#icon-search"></use></svg>
-        <input id="tree-search" type="search" autocomplete="off" placeholder="搜索文件或目录">
+        <input id="tree-search" type="search" autocomplete="off" placeholder="搜索路径或 SHA-256">
       </label>
       <div class="toolbar-filters">
         <label><span class="sr-only">项目类型</span><select id="kind-filter">
@@ -42,11 +42,9 @@
           <option value="directory">目录</option>
           <option value="link">链接</option>
         </select></label>
-        <label><span class="sr-only">文件大小</span><select id="size-filter">
-          <option value="all">所有大小</option>
-          <option value="1m">至少 1 MiB</option>
-          <option value="100m">至少 100 MiB</option>
-        </select></label>
+        <label class="filter-field"><span class="sr-only">文件扩展名</span><input id="extension-filter" type="text" autocomplete="off" placeholder="扩展名 .py,.json"></label>
+        <label class="filter-field size-field"><span class="sr-only">最小文件大小 KiB</span><input id="min-size-filter" type="number" min="0" step="1" inputmode="decimal" placeholder="最小 KiB"></label>
+        <label class="filter-field size-field"><span class="sr-only">最大文件大小 KiB</span><input id="max-size-filter" type="number" min="0" step="1" inputmode="decimal" placeholder="最大 KiB"></label>
       </div>
       <div class="toolbar-actions">
         <button id="expand-all" type="button">全部展开</button>

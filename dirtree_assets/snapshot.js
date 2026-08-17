@@ -31,7 +31,9 @@
 
   var input = document.getElementById("tree-search");
   var kindFilter = document.getElementById("kind-filter");
-  var sizeFilter = document.getElementById("size-filter");
+  var extensionFilter = document.getElementById("extension-filter");
+  var minSizeFilter = document.getElementById("min-size-filter");
+  var maxSizeFilter = document.getElementById("max-size-filter");
   var matchCount = document.getElementById("match-count");
   var items = Array.prototype.slice.call(document.querySelectorAll(".tree-item"));
   var rootDetails = document.querySelector(".root-item > details");
@@ -50,35 +52,56 @@
     }
   }
 
-  function sizeMatches(item, threshold) {
-    if (threshold === "all") {
+  function sizeMatches(item, minimum, maximum) {
+    if (minimum === null && maximum === null) {
       return true;
     }
     if (item.getAttribute("data-kind") !== "file") {
       return false;
     }
-    return (Number(item.getAttribute("data-size")) || 0) >= Number(threshold);
+    var size = Number(item.getAttribute("data-size")) || 0;
+    return (minimum === null || size >= minimum) && (maximum === null || size <= maximum);
+  }
+
+  function extensionMatches(item, extensions) {
+    if (!extensions.length) {
+      return true;
+    }
+    if (item.getAttribute("data-kind") !== "file") {
+      return false;
+    }
+    var path = (item.getAttribute("data-path") || "").toLocaleLowerCase();
+    return extensions.some(function (extension) {
+      return path.endsWith(extension);
+    });
   }
 
   function filterTree() {
     var query = input.value.trim().toLocaleLowerCase();
     var kind = kindFilter.value;
-    var threshold = sizeFilter.value === "1m" ? 1024 * 1024 : sizeFilter.value === "100m" ? 100 * 1024 * 1024 : "all";
+    var extensions = extensionFilter.value.split(/[,\s]+/).map(function (value) {
+      var normalized = value.trim().toLocaleLowerCase();
+      return normalized && normalized.charAt(0) !== "." ? "." + normalized : normalized;
+    }).filter(Boolean);
+    var minimum = minSizeFilter.value === "" ? null : Number(minSizeFilter.value) * 1024;
+    var maximum = maxSizeFilter.value === "" ? null : Number(maxSizeFilter.value) * 1024;
     var candidates = items.filter(function (item) {
       var kindMatch = kind === "all" || item.getAttribute("data-kind") === kind;
       var queryMatch = !query || (item.getAttribute("data-search") || "").toLocaleLowerCase().indexOf(query) !== -1;
-      return kindMatch && queryMatch && sizeMatches(item, threshold);
+      return kindMatch && queryMatch && extensionMatches(item, extensions) && sizeMatches(item, minimum, maximum);
     });
     items.forEach(function (item) {
       item.hidden = true;
     });
     candidates.forEach(reveal);
-    matchCount.textContent = (query || kind !== "all" || threshold !== "all") ? candidates.length + " 项" : "";
+    matchCount.textContent = (query || kind !== "all" || extensions.length || minimum !== null || maximum !== null) ? candidates.length + " 项" : "";
   }
 
   input.addEventListener("input", filterTree);
   kindFilter.addEventListener("change", filterTree);
-  sizeFilter.addEventListener("change", filterTree);
+  extensionFilter.addEventListener("input", filterTree);
+  minSizeFilter.addEventListener("input", filterTree);
+  maxSizeFilter.addEventListener("input", filterTree);
   input.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
       input.value = "";
@@ -115,16 +138,16 @@
   }
 
   document.addEventListener("click", function (event) {
-    var button = event.target.closest(".copy-path");
+    var button = event.target.closest(".copy-path, .copy-value");
     if (!button) {
       return;
     }
-    var value = button.getAttribute("data-copy-path") || "";
+    var value = button.getAttribute("data-copy-path") || button.getAttribute("data-copy-value") || "";
     var copy = navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(value) : Promise.resolve().then(function () { fallbackCopy(value); });
     copy.then(function () {
       var original = button.getAttribute("title");
       button.setAttribute("title", "已复制");
-      window.setTimeout(function () { button.setAttribute("title", original || "复制相对路径"); }, 1200);
+      window.setTimeout(function () { button.setAttribute("title", original || "复制"); }, 1200);
     }).catch(function () { fallbackCopy(value); });
   });
 

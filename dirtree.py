@@ -773,7 +773,7 @@ def _iter_html_directory(
             hash_attribute = html.escape(details.sha256 or "", quote=True)
             yield (
                 f'{indent}<li class="tree-item file-item" data-kind="file" '
-                f'data-size="{size_value}" data-sha256="{hash_attribute}" data-search="{search_path}">'
+                f'data-size="{size_value}" data-sha256="{hash_attribute}" data-path="{search_path}" data-search="{search_path} {hash_attribute}">'
             )
             yield (
                 f'{indent}  <div class="node-row"><span class="chevron-spacer"></span>'
@@ -786,9 +786,17 @@ def _iter_html_directory(
             if options.include_hash:
                 hash_value = details.sha256 or "unreadable"
                 hash_class = " unreadable" if hash_value == "unreadable" else ""
+                copy_hash = ""
+                if hash_value != "unreadable":
+                    escaped_hash = html.escape(hash_value, quote=True)
+                    copy_hash = (
+                        f'<button class="copy-value" type="button" data-copy-value="{escaped_hash}" '
+                        f'aria-label="复制 SHA-256" title="复制 SHA-256">'
+                        f'{_html_icon("copy", "copy-icon")}</button>'
+                    )
                 yield (
-                    f'{indent}  <div class="node-meta"><span class="node-meta-label">SHA-256</span>'
-                    f'<code class="hash-value{hash_class}">{html.escape(hash_value)}</code></div>'
+                    f'{indent}  <div class="node-meta hash-meta"><span class="node-meta-label">SHA-256</span>'
+                    f'<code class="hash-value{hash_class}">{html.escape(hash_value)}</code>{copy_hash}</div>'
                 )
             metadata_html = _metadata_html(entry.metadata, options.include_metadata)
             if metadata_html:

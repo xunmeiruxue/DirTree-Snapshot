@@ -212,13 +212,22 @@ h1 {
   gap: 8px;
 }
 
-.toolbar select {
+.toolbar select,
+.toolbar-filters input {
   height: 36px;
-  padding: 0 28px 0 10px;
+  padding: 0 10px;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
   background: var(--surface);
   color: var(--text);
+}
+
+.filter-field input {
+  width: 150px;
+}
+
+.size-field input {
+  width: 104px;
 }
 
 .toolbar-actions {
@@ -245,7 +254,8 @@ h1 {
 
 .toolbar button:focus-visible,
 .toolbar select:focus-visible,
-.copy-path:focus-visible {
+.copy-path:focus-visible,
+.copy-value:focus-visible {
   outline: 3px solid var(--accent-soft);
   outline-offset: 1px;
 }
@@ -258,7 +268,8 @@ h1 {
 }
 
 .icon-button svg,
-.copy-path svg {
+.copy-path svg,
+.copy-value svg {
   width: 17px;
   height: 17px;
   fill: none;
@@ -368,7 +379,8 @@ details[open] > summary .chevron {
   font-weight: 700;
 }
 
-.copy-path {
+.copy-path,
+.copy-value {
   display: inline-grid;
   width: 28px;
   height: 28px;
@@ -381,7 +393,8 @@ details[open] > summary .chevron {
   cursor: pointer;
 }
 
-.copy-path:hover {
+.copy-path:hover,
+.copy-value:hover {
   background: var(--accent-soft);
   color: var(--accent);
 }
@@ -410,6 +423,10 @@ body[data-theme="dark"] .node-meta {
   background: #f3f9f5;
   color: var(--success);
   font-size: 11px;
+}
+
+.hash-meta {
+  grid-template-columns: auto minmax(0, 1fr) 28px;
 }
 
 .node-meta-label {
@@ -518,7 +535,8 @@ body[data-theme="dark"] .hash-value {
     flex: 1 1 140px;
   }
 
-  .toolbar-filters select {
+  .toolbar-filters select,
+  .toolbar-filters input {
     width: 100%;
   }
 
@@ -564,7 +582,8 @@ body[data-theme="dark"] .hash-value {
   }
 
   .toolbar,
-  .copy-path {
+  .copy-path,
+  .copy-value {
     display: none;
   }
 
