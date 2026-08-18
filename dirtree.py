@@ -1047,7 +1047,7 @@ def default_output_path(
 
 _SCAN_CONFIG_KEYS = {
     "directory", "output", "format", "dirs_only", "hash", "metadata",
-    "no_cache", "fast", "exclude", "include",
+    "no_cache", "fast", "resume", "exclude", "include",
 }
 
 
@@ -1070,7 +1070,7 @@ def _load_scan_config(path_value: str) -> tuple[Path, dict[str, object]]:
     for key in ("directory", "output", "format"):
         if key in payload and not isinstance(payload[key], str):
             raise ValueError(f"Scan config field {key!r} must be a string")
-    for key in ("dirs_only", "hash", "metadata", "no_cache", "fast"):
+    for key in ("dirs_only", "hash", "metadata", "no_cache", "fast", "resume"):
         if key in payload and not isinstance(payload[key], bool):
             raise ValueError(f"Scan config field {key!r} must be true or false")
     for key in ("exclude", "include"):
@@ -1149,6 +1149,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the hash workload pre-scan for large directories",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=None,
+        help="resume an interrupted scan by reusing cached hashes",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         default=None,
@@ -1199,6 +1205,7 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     include_metadata = args.metadata if args.metadata is not None else bool(config.get("metadata", False))
     no_cache = args.no_cache if args.no_cache is not None else bool(config.get("no_cache", False))
     fast_scan = args.fast if args.fast is not None else bool(config.get("fast", False))
+    resume_scan = args.resume if args.resume is not None else bool(config.get("resume", False))
     exclude_patterns = tuple(args.exclude if args.exclude is not None else config.get("exclude", []))
     include_patterns = tuple(args.include if args.include is not None else config.get("include", []))
     if args.output is not None:
@@ -1213,6 +1220,9 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     if output_format is not None and not isinstance(output_format, str):
         parser.error("output format must be a string")
 
+    if resume_scan:
+        include_hash = True
+        no_cache = False
     if dirs_only and include_hash:
         parser.error("--hash cannot be combined with --dirs-only")
     if no_cache and not include_hash:
@@ -1274,6 +1284,7 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     print(f"Output format: {options.output_format}")
     print(f"SHA-256: {'enabled' if options.include_hash else 'disabled'}")
     print(f"Fast scan: {'enabled' if fast_scan else 'disabled'}")
+    print(f"Resume: {'enabled' if resume_scan else 'disabled'}")
     if options.include_hash:
         cache_label = str(hash_cache.path) if hash_cache is not None else "disabled"
         print(f"Hash cache: {cache_label}")
@@ -1281,8 +1292,11 @@ def _run_snapshot(arguments: Sequence[str]) -> int:
     print(f"Output file: {output}")
 
     hash_progress: Optional[_HashProgress] = None
-    if options.include_hash and fast_scan:
-        print("Fast scan enabled: skipping hash workload pre-scan.", file=sys.stderr)
+    if options.include_hash and (fast_scan or resume_scan):
+        if resume_scan:
+            print("Resume enabled: reusing cached hashes, skipping pre-scan.", file=sys.stderr)
+        else:
+            print("Fast scan enabled: skipping hash workload pre-scan.", file=sys.stderr)
     elif options.include_hash:
         print("Counting files and bytes for hash progress...", file=sys.stderr)
         hash_exclusions = {_path_key(output)}
@@ -1507,6 +1521,11 @@ def _run_interactive() -> int:
             return 2
         if _is_yes(fast_value):
             snapshot_arguments.append("--fast")
+        resume_value = _prompt_value("Resume interrupted scan? (y/N): ")
+        if resume_value is None:
+            return 2
+        if _is_yes(resume_value):
+            snapshot_arguments.append("--resume")
         cache_value = _prompt_value("Use saved hash cache? (Y/n): ")
         if cache_value is None:
             return 2

@@ -1,10 +1,13 @@
 # DirTree Snapshot
 
+[中文文档](README_zh.md) | **English**
+
 A lightweight Windows CLI tool that recursively scans a directory and produces a
 portable, human-readable snapshot of every file and folder inside it. Optionally
-records file sizes and SHA-256 hashes so you can later verify that nothing was
-lost or corrupted. Snapshots can be compared side by side or verified against a
-live directory to confirm that every file is present and unchanged.
+records file sizes, SHA-256 hashes, and file metadata so you can later verify
+that nothing was lost or corrupted. Snapshots can be compared side by side or
+verified against a live directory to confirm that every file is present and
+unchanged.
 
 ## Why this tool exists
 
@@ -35,17 +38,30 @@ re-scanning the original.
 - **Persistent hash cache**: previously computed hashes are stored in a local
   SQLite database and reused when file size and mtime are unchanged, so
   repeated scans of the same directory are fast.
+- **Resume interrupted scans**: `--resume` reuses cached hashes to skip files
+  that were already hashed before the interruption.
+- **File metadata**: `--metadata` records modified time, metadata change time,
+  permissions mode, and read-only status for every entry.
+- **Exclude and include rules**: `--exclude PATTERN` and `--include PATTERN`
+  filter files and directories by name or glob pattern; may be repeated.
+- **Reusable scan configuration**: `--config FILE` loads scan settings from a
+  JSON file; CLI arguments override config values.
+- **Fast scan mode**: `--fast` skips the hash workload pre-scan for large
+  directories.
 - `--dirs-only` mode to record just the directory structure.
 - Generates standalone interactive HTML reports with search, expand/collapse,
-  and print support.
+  filters, dark mode, and print support.
 - Also supports plain-text snapshots and canonical JSON snapshots for scripting
   and machine processing.
-- **Snapshot comparison**: compares two snapshot files (HTML, text, or JSON) and
-  detects added, removed, and changed files, with optional case-sensitive path
-  matching.
-- Comparison reports in HTML or text format, with optional unchanged items.
+- **Snapshot comparison**: compares two snapshot files (HTML, text, or JSON)
+  and detects added, removed, changed, and renamed files (by hash), with
+  optional case-sensitive path matching.
+- Comparison reports in HTML, text, or JSON format, with optional unchanged
+  items.
 - **Live verification**: verify a saved snapshot against a current directory to
   see which files are missing, added, or changed in real time.
+- **Enhanced HTML reports**: type/size/extension filters, total size metric,
+  copy-to-clipboard for paths and SHA-256 hashes, and dark/light theme toggle.
 - Each snapshot carries a timestamp; output filenames include the timestamp by
   default to avoid accidental overwrites.
 - Symlinks and Windows junctions are detected and marked
@@ -84,9 +100,13 @@ DirTree Snapshot
 [2] Compare two snapshots
 [3] Verify snapshot against directory
 [4] Manage hash cache
-Choose action (1/2/3/4, default 1): 1
+[5] Generate snapshot from config
+Choose action (1/2/3/4/5, default 1): 1
 Directory to scan: D:\Backup\ProjectA
 Calculate SHA-256 hashes? (y/N): y
+Include file metadata? (y/N):
+Fast scan for large directories? (y/N):
+Resume interrupted scan? (y/N):
 Use saved hash cache? (Y/n):
 Output format (html/text/json, default html):
 ```
@@ -94,52 +114,6 @@ Output format (html/text/json, default html):
 You can type the path manually or drag a folder onto the terminal; surrounding
 quotes are stripped automatically. If the window shows `Python 3 was not found`,
 install Python 3.9 or later.
-
-### Generate a snapshot
-
-```text
-Scanning: D:\Backup\ProjectA
-Output format: html
-SHA-256: enabled
-Hash cache: ~/.dsh/dirtree-cache.sqlite3
-Snapshot time: 2026-08-08 09:29:15 +0800
-Output file: D:\Tools\ProjectA-tree-20260808-092915.html
-Snapshot written: D:\Tools\ProjectA-tree-20260808-092915.html
-Found 12 directories, 86 files, and 0 links.
-```
-
-If no output path is given, the snapshot is written to the current directory as
-`<folder-name>-tree-<YYYYMMDD-HHMMSS>.html` (or `.txt` / `.json` depending on
-the format). If a file with the same name already exists, a `-2`, `-3`, …
-suffix is appended automatically.
-
-### Compare two snapshots
-
-```text
-Choose action (1/2/3/4, default 1): 2
-Left snapshot file: D:\Tools\ProjectA-tree-20260808-092915.html
-Right snapshot file: E:\Backup\ProjectA-tree-20260809-080000.html
-Output file (Enter for automatic name):
-Include unchanged items? (y/N):
-```
-
-The comparison report highlights files that were **added**, **removed**, or
-**changed** (size or hash mismatch) between the two snapshots.
-
-### Verify a snapshot against a live directory
-
-```text
-Choose action (1/2/3/4, default 1): 3
-Snapshot file: D:\Tools\ProjectA-tree-20260808-092915.html
-Directory to verify: D:\Backup\ProjectA
-Report file (Enter for automatic name):
-Hash current files? (Y/n/auto):
-Include unchanged items? (y/N):
-```
-
-The verification report shows which files from the snapshot are **missing**,
-which files in the directory are **new**, and which files have **changed** (size
-or hash mismatch) since the snapshot was taken.
 
 ## Usage
 
@@ -177,10 +151,40 @@ Include SHA-256 hashes (with progress bar and cache):
 dirtree.cmd "D:\Backup\ProjectA" --hash
 ```
 
-Calculate hashes without using the cache:
+Include file metadata (timestamps, permissions, read-only):
 
 ```powershell
-dirtree.cmd "D:\Backup\ProjectA" --hash --no-cache
+dirtree.cmd "D:\Backup\ProjectA" --hash --metadata
+```
+
+Exclude files or directories:
+
+```powershell
+dirtree.cmd "D:\Backup\ProjectA" --exclude .git --exclude node_modules --exclude "*.tmp"
+```
+
+Include only specific file types:
+
+```powershell
+dirtree.cmd "D:\Backup\ProjectA" --include "*.py" --include "*.json"
+```
+
+Use a scan configuration file:
+
+```powershell
+dirtree.cmd --config dirtree.example.json
+```
+
+Fast scan for large directories:
+
+```powershell
+dirtree.cmd "D:\Backup\LargeProject" --hash --fast
+```
+
+Resume an interrupted scan:
+
+```powershell
+dirtree.cmd "D:\Backup\ProjectA" --hash --resume
 ```
 
 ### Compare command
@@ -198,10 +202,11 @@ Specify an output report:
 dirtree.cmd compare LEFT.html RIGHT.html -o "D:\Reports\comparison.html"
 ```
 
-Output a text comparison report:
+Output a text or JSON comparison report:
 
 ```powershell
 dirtree.cmd compare LEFT.html RIGHT.html --format text
+dirtree.cmd compare LEFT.html RIGHT.html --format json -o comparison.json
 dirtree.cmd compare LEFT.txt RIGHT.txt -o comparison.txt
 ```
 
@@ -264,18 +269,44 @@ dirtree.cmd cache prune
 dirtree.cmd cache prune --days 7
 ```
 
-### All options
+### Scan configuration file
+
+Reuse scan settings from a JSON file:
+
+```json
+{
+  "directory": ".",
+  "output": "./project-tree.json",
+  "format": "json",
+  "hash": true,
+  "metadata": true,
+  "fast": true,
+  "exclude": [".git", "node_modules", "*.tmp"],
+  "include": []
+}
+```
+
+CLI arguments override config values. Relative paths in the config are resolved
+relative to the config file's directory.
+
+## All options
 
 **Snapshot:**
 
 | Option | Description |
 | --- | --- |
 | `directory` | Directory to scan; prompts when omitted |
+| `--config FILE` | Reuse scan settings from a JSON configuration file |
 | `-o, --output FILE` | Output file path |
 | `--format {html,text,json}` | Output format; inferred from extension, otherwise HTML |
 | `-d, --dirs-only` | Record directories and links only; omit files |
 | `--hash` | Include SHA-256 hashes and show hashing progress |
+| `--metadata` | Include timestamps, permissions, mode, and read-only metadata |
+| `--fast` | Skip the hash workload pre-scan for large directories |
+| `--resume` | Resume an interrupted scan by reusing cached hashes |
 | `--no-cache` | Calculate hashes without reading or updating the cache |
+| `--exclude PATTERN` | Exclude matching files or directories; may be repeated |
+| `--include PATTERN` | Include matching files or links; may be repeated |
 | `--version` | Print the current version |
 
 **Compare:**
@@ -285,7 +316,7 @@ dirtree.cmd cache prune --days 7
 | `left` | Source or earlier snapshot file |
 | `right` | Backup or later snapshot file |
 | `-o, --output FILE` | Report output file |
-| `--format {html,text}` | Report format; inferred from `.txt`, otherwise HTML |
+| `--format {html,text,json}` | Report format; inferred from extension, otherwise HTML |
 | `--include-unchanged` | Show unchanged items in the report |
 | `--case-sensitive` | Compare paths with case sensitivity |
 
@@ -312,7 +343,8 @@ dirtree.cmd cache prune --days 7
 | `--file PATH` | Override cache database path |
 
 `--hash` and `--dirs-only` are mutually exclusive. `--no-cache` requires
-`--hash`. The parent directory of `--output` must already exist.
+`--hash`. `--resume` implies `--hash` and uses the cache. The parent
+directory of `--output` must already exist.
 
 ## Snapshot formats
 
@@ -320,9 +352,15 @@ dirtree.cmd cache prune --days 7
 
 A standalone, interactive HTML page with:
 
-- Searchable file/folder tree (type to filter, Esc to clear).
+- Searchable file/folder tree (type to filter by path or SHA-256, Esc to clear).
+- Type filter (all/files/directories/links).
+- File size filter (minimum and maximum KiB).
+- File extension filter (comma-separated, e.g. `.py,.json`).
 - Expand-all / collapse-all buttons.
+- Dark/light theme toggle (remembered via localStorage).
 - File sizes and optional SHA-256 hashes displayed inline.
+- Copy-to-clipboard for relative paths and SHA-256 hashes.
+- Total file size metric in the header.
 - Summary metrics (directories, files, links, errors) in the header.
 - Snapshot timestamp in the header.
 - Print-friendly layout (all nodes auto-expand when printing).
@@ -333,7 +371,7 @@ A standalone, interactive HTML page with:
 # DirTree Snapshot v2
 # Created: 2026-08-08T09:29:15+08:00
 # Mode: files-and-directories
-# Details: size-bytes,sha256
+# Details: size-bytes,metadata,sha256
 # Paths: relative-to-root
 .
 |-- docs/
@@ -350,7 +388,7 @@ A standalone, interactive HTML page with:
 
 Canonical machine-readable format with a structured schema, including tool
 version, timestamp, mode, hash algorithm, statistics, and a flat list of
-entries with path, kind, size, and optional SHA-256.
+entries with path, kind, size, optional SHA-256, and optional metadata.
 
 ## Error handling
 
