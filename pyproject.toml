@@ -22,7 +22,7 @@ classifiers = [
 dirtree = "dirtree:main"
 
 [tool.setuptools]
-py-modules = ["dirtree", "dirtree_compare", "dirtree_cache", "dirtree_verify"]
+py-modules = ["dirtree", "dirtree_compare", "dirtree_cache", "dirtree_verify", "dirtree_gui"]
 packages = ["dirtree_assets"]
 
 [tool.setuptools.package-data]

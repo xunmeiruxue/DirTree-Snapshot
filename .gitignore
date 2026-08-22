@@ -5,3 +5,5 @@ build/
 dist/
 *.egg-info/
 *.spec
+# dirtree_gui.spec is tracked explicitly
+!dirtree_gui.spec

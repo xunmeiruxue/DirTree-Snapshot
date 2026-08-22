@@ -1,0 +1,72 @@
+name: Build GUI (test)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dirtree_gui.py'
+      - 'dirtree_gui.spec'
+      - 'dirtree.py'
+      - 'dirtree_compare.py'
+      - 'dirtree_verify.py'
+      - 'dirtree_cache.py'
+      - 'dirtree_assets/**'
+      - '.github/workflows/build-gui.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'dirtree_gui.py'
+      - 'dirtree_gui.spec'
+      - 'dirtree.py'
+      - 'dirtree_compare.py'
+      - 'dirtree_verify.py'
+      - 'dirtree_cache.py'
+      - 'dirtree_assets/**'
+      - '.github/workflows/build-gui.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller
+
+      - name: Verify Python syntax
+        run: |
+          python -m py_compile dirtree.py dirtree_compare.py dirtree_verify.py dirtree_cache.py dirtree_gui.py
+
+      - name: Build executable
+        run: python -m PyInstaller --clean --noconfirm dirtree_gui.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirtree-gui-windows
+          path: dist/dirtree-gui.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # NOTE: Release publishing is disabled during testing.
+      # To enable, uncomment the step below and add a publish trigger.
+      # - name: Upload to Release
+      #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     tag_name: gui-test-${{ github.sha }}
+      #     files: dist/dirtree-gui.exe
+      #     prerelease: true
