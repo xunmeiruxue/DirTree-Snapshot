@@ -12,11 +12,12 @@ import os
 import queue
 import sys
 import threading
+import traceback
 import webbrowser
-from pathlib import Path
+import tkinter as tk
 from tkinter import (
-    BOTH, END, LEFT, RIGHT, X, Y, BOTTOM, NONE, NORMAL, DISABLED,
-    StringVar, BooleanVar, IntVar,
+    BOTH, END, LEFT, RIGHT, X, Y, BOTTOM, NORMAL, DISABLED,
+    StringVar, BooleanVar,
     filedialog, messagebox, scrolledtext,
 )
 from tkinter import ttk
@@ -92,7 +93,7 @@ class DirTreeGUI:
     LABEL_WIDTH = 12
 
     def __init__(self):
-        self.root = ttk.Tk()
+        self.root = tk.Tk()
         self.root.title("DirTree Snapshot")
         self.root.geometry("780x640")
         self.root.minsize(680, 560)
@@ -587,9 +588,21 @@ class DirTreeGUI:
 
 
 def main():
-    _import_core()
-    app = DirTreeGUI()
-    app.root.mainloop()
+    try:
+        _import_core()
+        app = DirTreeGUI()
+        app.root.mainloop()
+    except Exception:
+        detail = traceback.format_exc()
+        try:
+            sys.stderr.write(detail)
+        except Exception:
+            pass
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("DirTree Snapshot — startup error", detail)
+        root.destroy()
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
